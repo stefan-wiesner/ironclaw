@@ -24,6 +24,7 @@ use crate::tools::builtin::{
     ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
+use crate::tools::executor::ToolExecutor;
 use crate::tools::tool::{Tool, ToolDomain};
 use crate::tools::wasm::{
     Capabilities, OAuthRefreshConfig, ResourceLimits, SharedCredentialRegistry, WasmError,
@@ -87,6 +88,8 @@ pub struct ToolRegistry {
     rate_limiter: RateLimiter,
     /// Reference to the message tool for setting context per-turn.
     message_tool: RwLock<Option<Arc<crate::tools::builtin::MessageTool>>>,
+    /// Tool executor for injecting into WASM tools (enables PTC via tool_invoke).
+    tool_executor: RwLock<Option<Arc<ToolExecutor>>>,
 }
 
 impl ToolRegistry {
@@ -99,6 +102,7 @@ impl ToolRegistry {
             secrets_store: None,
             rate_limiter: RateLimiter::new(),
             message_tool: RwLock::new(None),
+            tool_executor: RwLock::new(None),
         }
     }
 
@@ -121,6 +125,14 @@ impl ToolRegistry {
     /// Get the shared rate limiter for checking built-in tool limits.
     pub fn rate_limiter(&self) -> &RateLimiter {
         &self.rate_limiter
+    }
+
+    /// Set the tool executor for programmatic tool calling (PTC).
+    ///
+    /// When set, WASM tools registered after this call will have `tool_invoke`
+    /// enabled, allowing them to call other tools synchronously.
+    pub async fn set_tool_executor(&self, executor: Arc<ToolExecutor>) {
+        *self.tool_executor.write().await = Some(executor);
     }
 
     /// Register a tool. Rejects dynamic tools that try to shadow a built-in name.
@@ -555,6 +567,11 @@ impl ToolRegistry {
         }
         if let Some(oauth) = reg.oauth_refresh {
             wrapper = wrapper.with_oauth_refresh(oauth);
+        }
+
+        // Inject tool executor for PTC if available
+        if let Some(executor) = self.tool_executor.read().await.as_ref() {
+            wrapper = wrapper.with_tool_executor(Arc::clone(executor));
         }
 
         // Register the tool
