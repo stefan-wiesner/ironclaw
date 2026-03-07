@@ -152,8 +152,12 @@ This is OS-level behavior we cannot prevent. To minimize pain:
   rather than triggering system dialogs.
 
 **Invariant:** After Step 2, `self.secrets_crypto` is `Some` if the user
-chose Keychain or generated a new key. It may be `None` if the user chose
-env-var mode or skipped secrets.
+chose Keychain or env-var mode (both generate a key and initialize crypto
+immediately). It is `None` only if the user skipped secrets.
+
+When env-var mode is chosen, the generated key is also stored in
+`self.secrets_master_key_hex` so that `write_bootstrap_env()` can persist
+it to `~/.ironclaw/.env` automatically.
 
 ---
 

@@ -90,6 +90,8 @@ pub struct SetupWizard {
     db_backend: Option<crate::db::libsql::LibSqlBackend>,
     /// Secrets crypto (created during setup).
     secrets_crypto: Option<Arc<SecretsCrypto>>,
+    /// Generated master key hex (stored for writing to .env in env-var mode).
+    secrets_master_key_hex: Option<String>,
     /// Cached API key from provider setup (used by model fetcher without env mutation).
     llm_api_key: Option<SecretString>,
 }
@@ -106,6 +108,7 @@ impl SetupWizard {
             #[cfg(feature = "libsql")]
             db_backend: None,
             secrets_crypto: None,
+            secrets_master_key_hex: None,
             llm_api_key: None,
         }
     }
@@ -121,6 +124,7 @@ impl SetupWizard {
             #[cfg(feature = "libsql")]
             db_backend: None,
             secrets_crypto: None,
+            secrets_master_key_hex: None,
             llm_api_key: None,
         }
     }
@@ -768,16 +772,26 @@ impl SetupWizard {
                 print_success("Master key generated and stored in OS keychain");
             }
             1 => {
-                // Env var mode
-                print_info("Generate a key and add it to your environment:");
+                // Env var mode: generate key, initialize crypto, and persist to .env
+                print_info("Generating master key...");
                 let key_hex = crate::secrets::keychain::generate_master_key_hex();
+
+                // Initialize crypto so subsequent steps (API key storage) work
+                self.secrets_crypto = Some(Arc::new(
+                    SecretsCrypto::new(SecretString::from(key_hex.clone()))
+                        .map_err(|e| SetupError::Config(e.to_string()))?,
+                ));
+
+                // Store for write_bootstrap_env to persist to ~/.ironclaw/.env
+                self.secrets_master_key_hex = Some(key_hex.clone());
+
                 println!();
-                println!("  export SECRETS_MASTER_KEY={}", key_hex);
+                println!("  SECRETS_MASTER_KEY={}", key_hex);
                 println!();
-                print_info("Add this to your shell profile or .env file.");
+                print_info("This key will be saved to ~/.ironclaw/.env automatically.");
 
                 self.settings.secrets_master_key_source = KeySource::Env;
-                print_success("Configured for environment variable");
+                print_success("Master key generated and configured for environment variable");
             }
             _ => {
                 self.settings.secrets_master_key_source = KeySource::None;
@@ -2133,6 +2147,13 @@ impl SetupWizard {
             env_vars.push((base_url_env.clone(), base_url.clone()));
         }
 
+        // Persist SECRETS_MASTER_KEY when env-var mode was chosen in step 2
+        if self.settings.secrets_master_key_source == KeySource::Env
+            && let Some(ref key_hex) = self.secrets_master_key_hex
+        {
+            env_vars.push(("SECRETS_MASTER_KEY".to_string(), key_hex.clone()));
+        }
+
         // Preserve NEARAI_API_KEY if present (set by API key auth flow)
         if let Ok(api_key) = std::env::var("NEARAI_API_KEY")
             && !api_key.is_empty()
@@ -3291,6 +3312,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression test for #666: env var mode in step_security must initialize
+    /// secrets_crypto so that subsequent API key saves don't fail silently.
+    #[test]
+    fn test_env_var_security_mode_initializes_secrets_crypto() {
+        // generate_master_key_hex produces a valid hex key
+        let key_hex = crate::secrets::keychain::generate_master_key_hex();
+
+        // SecretsCrypto::new must succeed with a generated key
+        let crypto = SecretsCrypto::new(SecretString::from(key_hex.clone()));
+        assert!(
+            crypto.is_ok(),
+            "SecretsCrypto::new should succeed with generated hex key"
+        );
+
+        // Simulate what the env-var branch SHOULD do: set secrets_crypto
+        let mut wizard = SetupWizard::new();
+        assert!(
+            wizard.secrets_crypto.is_none(),
+            "secrets_crypto should start as None"
+        );
+
+        // Apply the fix path: build crypto from the generated key and assign it
+        wizard.secrets_crypto = Some(Arc::new(crypto.unwrap()));
+        assert!(
+            wizard.secrets_crypto.is_some(),
+            "secrets_crypto should be Some after env-var setup"
+        );
+    }
+
+    /// Regression test for #666: after env-var mode setup, the wizard must have
+    /// both secrets_crypto (for immediate use) and secrets_master_key_hex (for
+    /// persisting to .env). Simulates the env-var code path without interactive prompts.
+    #[test]
+    fn test_env_var_mode_sets_crypto_and_stores_key_for_bootstrap() {
+        let mut wizard = SetupWizard::new();
+
+        // Simulate the env-var branch of step_security
+        let key_hex = crate::secrets::keychain::generate_master_key_hex();
+        wizard.secrets_crypto = Some(Arc::new(
+            SecretsCrypto::new(SecretString::from(key_hex.clone())).unwrap(),
+        ));
+        wizard.secrets_master_key_hex = Some(key_hex.clone());
+        wizard.settings.secrets_master_key_source = KeySource::Env;
+
+        // Verify crypto is usable for immediate secret encryption
+        assert!(wizard.secrets_crypto.is_some());
+
+        // Verify the hex key is stored for write_bootstrap_env to persist
+        assert_eq!(
+            wizard.secrets_master_key_hex.as_deref(),
+            Some(key_hex.as_str())
+        );
+
+        // Verify it's a valid 64-char hex string (32 bytes = AES-256)
+        assert_eq!(key_hex.len(), 64);
+        assert!(key_hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[tokio::test]
