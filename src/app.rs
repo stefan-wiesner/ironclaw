@@ -383,10 +383,7 @@ impl AppBuilder {
                     if let Some(image_model) =
                         crate::llm::image_models::suggest_image_model(&models)
                     {
-                        tools.register_image_tools(
-                            self.config.llm.nearai.clone(),
-                            Arc::clone(&ws),
-                        );
+                        tools.register_image_tools(self.config.llm.nearai.clone(), Arc::clone(&ws));
                         tracing::info!(
                             "Image generation tools registered (model: {})",
                             image_model
