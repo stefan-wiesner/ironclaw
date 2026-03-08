@@ -1,281 +1,49 @@
 name: Claude Code Review
 
 on:
-  workflow_call:
-    inputs:
-      diff_range:
-        description: "Git diff range to review (e.g., abc123..def456)"
-        required: true
-        type: string
-      ref:
-        description: "Git ref to checkout"
-        required: false
-        type: string
-        default: staging
-    outputs:
-      has_blocking:
-        description: "Whether blocking findings were found (CRITICAL ≥80 confidence)"
-        value: ${{ jobs.review.outputs.has_blocking }}
-  workflow_dispatch:
-    inputs:
-      diff_range:
-        description: "Git diff range to review"
-        required: true
-        type: string
-      ref:
-        description: "Git ref to checkout"
-        required: false
-        type: string
-        default: staging
+  pull_request:
+    types: [opened, synchronize]
 
 permissions:
   contents: read
+  pull-requests: write
   issues: write
-  id-token: write                    # Required by anthropics/claude-code-action for OIDC
+  id-token: write
 
 jobs:
   review:
     name: Claude Code Review
+    if: contains(github.event.pull_request.labels.*.name, 'staging-promotion')
     runs-on: ubuntu-latest
-    outputs:
-      has_blocking: ${{ steps.gate-check.outputs.has_blocking }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.ref }}
           fetch-depth: 0
 
-      - name: Check diff availability
-        id: diff
-        run: |
-          RANGE="${{ inputs.diff_range }}"
-          if [ -z "$RANGE" ]; then
-            echo "diff_available=false" >> "$GITHUB_OUTPUT"
-            echo "No diff range provided"
-          else
-            echo "diff_available=true" >> "$GITHUB_OUTPUT"
-            echo "Reviewing range: ${RANGE}"
-          fi
-
       - name: Run Claude Code review
-        id: claude-review
-        if: steps.diff.outputs.diff_available == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
-            Review the diff for range `${{ inputs.diff_range }}` in this repo.
-            Run `git diff ${{ inputs.diff_range }}` to see what changed.
+            Review this PR for security vulnerabilities, bugs, and code quality issues.
 
-            Categorize each finding by severity (CRITICAL/HIGH/MEDIUM/LOW) and assign
-            a confidence score (0-100). Only report issues you're confident about.
+            Prefix EVERY review comment with a severity and confidence tag:
+            [SEVERITY:CONFIDENCE] where SEVERITY is CRITICAL/HIGH/MEDIUM/LOW
+            and CONFIDENCE is 0-100.
 
-            CRITICAL: security vulns, panics in prod (.unwrap/.expect), data exfiltration, race conditions
-            HIGH: logic bugs, missing error handling, breaking API/schema changes
-            MEDIUM: missing tests, unnecessary complexity, performance issues
-            LOW: documentation gaps, naming suggestions
+            Example: [CRITICAL:92] This .unwrap() can panic in production when the config file is missing.
 
-            Confidence: 90-100 = certain, 70-89 = very likely, 50-69 = possible, 0-49 = speculative
+            Severity guide:
+            - CRITICAL: security vulns, panics in prod (.unwrap/.expect), data exfiltration, race conditions
+            - HIGH: logic bugs, missing error handling, breaking API/schema changes
+            - MEDIUM: missing tests, unnecessary complexity, performance issues
+            - LOW: documentation gaps, naming suggestions
 
-            Return structured JSON with: summary, critical[], high[], medium[], low[]
-            Each finding: {title, description, file, line, confidence}
+            Confidence guide:
+            - 90-100: certain this is a real issue
+            - 70-89: very likely but needs human verification
+            - 50-69: possible issue, not fully sure of context
+            - 0-49: speculative, might be false positive
+
+            Only report real issues you're confident about. Be concise. No nitpicks.
           claude_args: "--max-turns 5"
-
-      - name: Extract results from execution log
-        id: process-results
-        if: always() && steps.diff.outputs.diff_available == 'true'
-        run: |
-          FALLBACK='{"summary":"Claude review did not produce structured output.","critical":[],"high":[],"medium":[],"low":[]}'
-          EXEC_FILE="${{ steps.claude-review.outputs.execution_file }}"
-
-          if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
-            # Extract the last assistant text message as the review result
-            RESULT=$(jq -r '[.[] | select(.type == "assistant" and .message != null) | .message] | last // empty' "$EXEC_FILE" 2>/dev/null || true)
-
-            # Try to parse as JSON (Claude may wrap in markdown code block)
-            if [ -n "$RESULT" ]; then
-              # Strip markdown code fences if present
-              CLEANED=$(echo "$RESULT" | sed 's/^```json//;s/^```//;s/```$//' | jq '.' 2>/dev/null || true)
-              if [ -n "$CLEANED" ]; then
-                echo "$CLEANED" > /tmp/review-results.json
-              else
-                echo "::warning::Could not parse Claude output as JSON, using fallback"
-                echo "$FALLBACK" > /tmp/review-results.json
-              fi
-            else
-              echo "::warning::No assistant messages in execution log, using fallback"
-              echo "$FALLBACK" > /tmp/review-results.json
-            fi
-          else
-            echo "::warning::No execution file found, using fallback"
-            echo "$FALLBACK" > /tmp/review-results.json
-          fi
-
-          # Ensure confidence field exists on all findings (default to 50 if missing)
-          for severity in critical high medium low; do
-            jq ".$severity = [.$severity[]? | .confidence = (.confidence // 50)]" /tmp/review-results.json > /tmp/review-results-tmp.json
-            mv /tmp/review-results-tmp.json /tmp/review-results.json
-          done
-
-      - name: Create GitHub issues for findings
-        if: always() && steps.diff.outputs.diff_available == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RANGE="${{ inputs.diff_range }}"
-          REPO="${{ github.repository }}"
-          # Use current HEAD SHA for permalinks
-          SHA=$(git rev-parse HEAD)
-          ISSUES_CREATED=0
-
-          # Function to create an issue for a finding
-          create_issue() {
-            local severity="$1" title="$2" file="$3" line="$4" confidence="$5" labels="$6"
-
-            jq -r ".$severity[$i].description // \"No description\"" /tmp/review-results.json > /tmp/issue-desc.txt
-            {
-              echo "## ${severity^^} Issue Found by Staging CI Review"
-              echo ""
-              echo "**Severity:** ${severity^^}"
-              echo "**Confidence:** ${confidence}/100"
-              echo "**File:** [\`${file}:${line}\`](https://github.com/${REPO}/blob/${SHA}/${file}#L${line})"
-              echo "**Commit range:** \`${RANGE}\`"
-              echo ""
-              echo "### Description"
-              cat /tmp/issue-desc.txt
-              echo ""
-              echo "---"
-              echo "*Auto-created by staging-ci Claude Code review*"
-            } > /tmp/issue-body.md
-
-            gh issue create \
-              --title "[${severity^^}] ${title}" \
-              --body-file /tmp/issue-body.md \
-              --label "${labels}"
-            ISSUES_CREATED=$((ISSUES_CREATED + 1))
-          }
-
-          # CRITICAL: always create issue (any confidence)
-          # ≥80 → bug,risk: high,staging-ci-review
-          # 50-79 → bug,risk: high,staging-ci-review
-          # <50 → bug,risk: high,staging-ci-review,low-confidence
-          CRIT_COUNT=$(jq '.critical | length' /tmp/review-results.json 2>/dev/null || echo 0)
-          for i in $(seq 0 $((CRIT_COUNT > 0 ? CRIT_COUNT - 1 : -1))); do
-            [ "$i" -lt 0 ] && break
-            TITLE=$(jq -r ".critical[$i].title // \"Untitled\"" /tmp/review-results.json)
-            FILE=$(jq -r ".critical[$i].file // \"unknown\"" /tmp/review-results.json)
-            LINE=$(jq -r ".critical[$i].line // 0" /tmp/review-results.json)
-            CONF=$(jq -r ".critical[$i].confidence // 50" /tmp/review-results.json)
-
-            LABELS="bug,risk: high,staging-ci-review"
-            if [ "$CONF" -lt 50 ]; then
-              LABELS="${LABELS},low-confidence"
-            fi
-            create_issue "critical" "$TITLE" "$FILE" "$LINE" "$CONF" "$LABELS"
-          done
-
-          # HIGH: create issue if confidence ≥50
-          HIGH_COUNT=$(jq '.high | length' /tmp/review-results.json 2>/dev/null || echo 0)
-          for i in $(seq 0 $((HIGH_COUNT > 0 ? HIGH_COUNT - 1 : -1))); do
-            [ "$i" -lt 0 ] && break
-            CONF=$(jq -r ".high[$i].confidence // 50" /tmp/review-results.json)
-            [ "$CONF" -lt 50 ] && continue
-            TITLE=$(jq -r ".high[$i].title // \"Untitled\"" /tmp/review-results.json)
-            FILE=$(jq -r ".high[$i].file // \"unknown\"" /tmp/review-results.json)
-            LINE=$(jq -r ".high[$i].line // 0" /tmp/review-results.json)
-            create_issue "high" "$TITLE" "$FILE" "$LINE" "$CONF" "bug,risk: medium,staging-ci-review"
-          done
-
-          # MEDIUM: create issue if confidence ≥80
-          MED_COUNT=$(jq '.medium | length' /tmp/review-results.json 2>/dev/null || echo 0)
-          for i in $(seq 0 $((MED_COUNT > 0 ? MED_COUNT - 1 : -1))); do
-            [ "$i" -lt 0 ] && break
-            CONF=$(jq -r ".medium[$i].confidence // 50" /tmp/review-results.json)
-            [ "$CONF" -lt 80 ] && continue
-            TITLE=$(jq -r ".medium[$i].title // \"Untitled\"" /tmp/review-results.json)
-            FILE=$(jq -r ".medium[$i].file // \"unknown\"" /tmp/review-results.json)
-            LINE=$(jq -r ".medium[$i].line // 0" /tmp/review-results.json)
-            create_issue "medium" "$TITLE" "$FILE" "$LINE" "$CONF" "risk: medium,staging-ci-review"
-          done
-
-          # LOW: create issue if confidence ≥80
-          LOW_COUNT=$(jq '.low | length' /tmp/review-results.json 2>/dev/null || echo 0)
-          for i in $(seq 0 $((LOW_COUNT > 0 ? LOW_COUNT - 1 : -1))); do
-            [ "$i" -lt 0 ] && break
-            CONF=$(jq -r ".low[$i].confidence // 50" /tmp/review-results.json)
-            [ "$CONF" -lt 80 ] && continue
-            TITLE=$(jq -r ".low[$i].title // \"Untitled\"" /tmp/review-results.json)
-            FILE=$(jq -r ".low[$i].file // \"unknown\"" /tmp/review-results.json)
-            LINE=$(jq -r ".low[$i].line // 0" /tmp/review-results.json)
-            create_issue "low" "$TITLE" "$FILE" "$LINE" "$CONF" "risk: low,staging-ci-review"
-          done
-
-          echo "Created ${ISSUES_CREATED} issues total"
-
-      - name: Write review summary
-        if: always() && steps.diff.outputs.diff_available == 'true'
-        run: |
-          if [ ! -f /tmp/review-results.json ]; then
-            echo "No review results to summarize" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          echo "## Claude Code Review Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          SUMMARY=$(jq -r '.summary // "No summary"' /tmp/review-results.json)
-          echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          # Count findings by severity
-          CRIT=$(jq '.critical | length' /tmp/review-results.json 2>/dev/null || echo 0)
-          HIGH=$(jq '.high | length' /tmp/review-results.json 2>/dev/null || echo 0)
-          MED=$(jq '.medium | length' /tmp/review-results.json 2>/dev/null || echo 0)
-          LOW=$(jq '.low | length' /tmp/review-results.json 2>/dev/null || echo 0)
-
-          # Count blocking (CRITICAL ≥80)
-          BLOCKING=$(jq '[.critical[]? | select(.confidence >= 80)] | length' /tmp/review-results.json 2>/dev/null || echo 0)
-
-          echo "| Severity | Count | Blocking (≥80 conf) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|----------|-------|---------------------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Critical | $CRIT | $BLOCKING |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| High | $HIGH | — |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Medium | $MED | — |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Low | $LOW | — |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          # Print all findings with confidence scores and computed action
-          TOTAL=$((CRIT + HIGH + MED + LOW))
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "### All Findings" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Severity | Confidence | Action | Title | File |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|----------|-----------|--------|-------|------|" >> "$GITHUB_STEP_SUMMARY"
-
-            # CRITICAL: always issue, ≥80 blocks
-            jq -r '.critical[]? | "| CRITICAL | \(.confidence) | \(if .confidence >= 80 then "BLOCKS + issue" elif .confidence >= 50 then "issue" else "issue (low-confidence)" end) | \(.title) | \(.file):\(.line) |"' /tmp/review-results.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-            # HIGH: issue if ≥50
-            jq -r '.high[]? | "| HIGH | \(.confidence) | \(if .confidence >= 50 then "issue" else "summary only" end) | \(.title) | \(.file):\(.line) |"' /tmp/review-results.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-            # MEDIUM: issue if ≥80
-            jq -r '.medium[]? | "| MEDIUM | \(.confidence) | \(if .confidence >= 80 then "issue" else "summary only" end) | \(.title) | \(.file):\(.line) |"' /tmp/review-results.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-            # LOW: issue if ≥80
-            jq -r '.low[]? | "| LOW | \(.confidence) | \(if .confidence >= 80 then "issue" else "summary only" end) | \(.title) | \(.file):\(.line) |"' /tmp/review-results.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-          fi
-
-      - name: Set gate output
-        id: gate-check
-        if: always()
-        run: |
-          # Default: no blocking findings
-          HAS_BLOCKING=false
-
-          if [ -f /tmp/review-results.json ]; then
-            # Only CRITICAL findings with confidence ≥80 block
-            BLOCKING=$(jq '[.critical[]? | select(.confidence >= 80)] | length' /tmp/review-results.json 2>/dev/null || echo 0)
-            if [ "$BLOCKING" -gt 0 ]; then
-              HAS_BLOCKING=true
-              echo "::warning::Found ${BLOCKING} blocking finding(s) (CRITICAL ≥80 confidence)"
-            fi
-          fi
-
-          echo "has_blocking=${HAS_BLOCKING}" >> "$GITHUB_OUTPUT"

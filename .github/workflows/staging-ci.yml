@@ -10,28 +10,26 @@ on:
         type: boolean
         default: false
       skip_claude_gate:
-        description: "Skip Claude review gate (bypass CRITICAL block)"
+        description: "Skip Claude review gate (bypass blocking findings)"
         type: boolean
         default: false
 
 permissions:
   contents: write
-  issues: write                    # Claude review creates issues for critical findings
-  pull-requests: write             # Auto-promote creates + merges PR to main
-  id-token: write                  # Required by claude-code-action for OIDC auth
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: staging-ci
   cancel-in-progress: false        # Let running suites finish
 
 jobs:
-  # ── Gate: check for new commits ──────────────────────────────────
+  # ── Check for new commits ──────────────────────────────────────
   check-changes:
     name: Check for new commits
     runs-on: ubuntu-latest
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
-      last_tested: ${{ steps.check.outputs.last_tested }}
       current_head: ${{ steps.check.outputs.current_head }}
       diff_range: ${{ steps.check.outputs.diff_range }}
     steps:
@@ -51,7 +49,6 @@ jobs:
           else
             LAST_TESTED=""
           fi
-          echo "last_tested=${LAST_TESTED}" >> "$GITHUB_OUTPUT"
 
           DIFF_RANGE=""
           if [ -n "$LAST_TESTED" ] && [ "$LAST_TESTED" = "$CURRENT_HEAD" ]; then
@@ -64,7 +61,6 @@ jobs:
               echo "Found ${COMMIT_COUNT} new commit(s) since last tested"
               DIFF_RANGE="${LAST_TESTED}..${CURRENT_HEAD}"
             else
-              # First run: use merge-base with main to capture all staging changes
               git fetch origin main
               MERGE_BASE=$(git merge-base origin/main HEAD)
               echo "First run -- reviewing from merge-base ${MERGE_BASE}"
@@ -76,7 +72,6 @@ jobs:
           if [ "${{ inputs.force }}" = "true" ]; then
             echo "Force run requested"
             HAS_CHANGES=true
-            # Use a valid empty range if no new commits
             if [ -z "$DIFF_RANGE" ]; then
               DIFF_RANGE="${CURRENT_HEAD}..${CURRENT_HEAD}"
             fi
@@ -99,82 +94,14 @@ jobs:
     if: needs.check-changes.outputs.has_changes == 'true'
     uses: ./.github/workflows/e2e.yml
 
-  # ── Thorough Claude Code review (reusable workflow) ──────────────
-  claude-review:
-    name: Claude Code Review
+  # ── Create promotion PR (triggers claude-review.yml on the PR) ──
+  create-promotion-pr:
+    name: Create Promotion PR
     needs: check-changes
     if: needs.check-changes.outputs.has_changes == 'true'
-    uses: ./.github/workflows/claude-review.yml
-    with:
-      diff_range: ${{ needs.check-changes.outputs.diff_range }}
-      ref: staging
-    secrets: inherit
-
-  # ── Gate: block on high-confidence findings unless overridden ────
-  claude-gate:
-    name: Claude Review Gate
-    needs: [check-changes, tests, e2e, claude-review]
-    if: >
-      always() &&
-      needs.check-changes.outputs.has_changes == 'true' &&
-      needs.tests.result == 'success' &&
-      needs.e2e.result == 'success' &&
-      needs.claude-review.result == 'success'
     runs-on: ubuntu-latest
     outputs:
-      gate_passed: ${{ steps.gate.outputs.passed }}
-    steps:
-      - name: Evaluate gate
-        id: gate
-        run: |
-          HAS_BLOCKING="${{ needs.claude-review.outputs.has_blocking }}"
-          SKIP_INPUT="${{ inputs.skip_claude_gate }}"
-
-          if [ "$HAS_BLOCKING" = "true" ]; then
-            echo "::warning::Claude review found blocking issues (CRITICAL ≥80 confidence)"
-            if [ "$SKIP_INPUT" = "true" ]; then
-              echo "::warning::Gate overridden by skip_claude_gate workflow input"
-              echo "passed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "::error::Blocking promotion to main due to CRITICAL findings (≥80 confidence)"
-              echo "passed=false" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-          else
-            echo "No blocking findings (CRITICAL ≥80). Gate passed."
-            echo "passed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  # ── Update tested tag on success ─────────────────────────────────
-  update-tag:
-    name: Update staging-tested tag
-    needs: [check-changes, claude-gate]
-    if: >
-      always() &&
-      needs.check-changes.outputs.has_changes == 'true' &&
-      needs.claude-gate.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: staging
-          fetch-depth: 1
-
-      - name: Update staging-tested tag
-        run: |
-          git tag -f staging-tested "${{ needs.check-changes.outputs.current_head }}"
-          git push origin staging-tested --force
-          echo "Updated staging-tested tag to ${{ needs.check-changes.outputs.current_head }}"
-
-  # ── Auto-promote: create PR from staging to main and merge ──────
-  promote-to-main:
-    name: Promote to Main
-    needs: [check-changes, claude-gate, update-tag]
-    if: >
-      needs.check-changes.outputs.has_changes == 'true' &&
-      needs.claude-gate.result == 'success' &&
-      needs.update-tag.result == 'success'
-    runs-on: ubuntu-latest
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -202,7 +129,20 @@ jobs:
             echo "Staging is ${AHEAD} commits ahead of main."
           fi
 
-      - name: Create and merge PR to main
+      - name: Close stale promotion PRs
+        if: steps.ahead-check.outputs.commits_ahead != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Close any existing staging->main PRs to avoid duplicates
+          EXISTING=$(gh pr list --base main --head staging --state open --json number -q '.[].number')
+          for PR in $EXISTING; do
+            echo "Closing stale promotion PR #${PR}"
+            gh pr close "$PR" --comment "Superseded by new staging-ci batch run"
+          done
+
+      - name: Create promotion PR
+        id: create-pr
         if: steps.ahead-check.outputs.commits_ahead != '0'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -210,15 +150,6 @@ jobs:
           RANGE="${{ needs.check-changes.outputs.diff_range }}"
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
 
-          # Check for existing open staging->main PR
-          EXISTING=$(gh pr list --base main --head staging --state open --json number -q '.[0].number')
-          if [ -n "$EXISTING" ]; then
-            echo "Existing PR #${EXISTING} found. Merging it."
-            gh pr merge "$EXISTING" --merge --auto
-            exit 0
-          fi
-
-          # Create new PR
           PR_URL=$(gh pr create \
             --base main \
             --head staging \
@@ -228,23 +159,239 @@ jobs:
           **Batch range:** \`${RANGE}\`
           **Triggered by:** Staging CI batch at ${TIMESTAMP}
 
-          All gates passed:
-          - Tests: passed
-          - Claude Code review: no CRITICAL findings (≥80 confidence)
-          - E2E: passed
+          Waiting for gates:
+          - Tests: pending
+          - E2E: pending
+          - Claude Code review: pending (will post comments on this PR)
 
           ---
           *Auto-created by staging-ci workflow*" \
-            --label "staging-ci-review")
+            --label "staging-promotion")
 
-          # Auto-merge (uses App token to bypass branch protection)
           PR_NUM=$(echo "$PR_URL" | grep -oE '[0-9]+$')
-          gh pr merge "$PR_NUM" --merge --auto
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+          echo "Created promotion PR #${PR_NUM}"
+
+  # ── Gate: wait for all checks, process findings, merge or block ──
+  gate:
+    name: Staging Gate
+    needs: [check-changes, tests, e2e, create-promotion-pr]
+    if: >
+      always() &&
+      needs.check-changes.outputs.has_changes == 'true' &&
+      needs.tests.result == 'success' &&
+      needs.e2e.result == 'success' &&
+      needs.create-promotion-pr.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      gate_passed: ${{ steps.evaluate.outputs.passed }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_RELEASES_MANAGER_APP_ID }}
+          private-key: ${{ secrets.GH_RELEASES_MANAGER_APP_PRIVATE_KEY }}
+
+      - name: Wait for Claude review on PR
+        id: wait-review
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ needs.create-promotion-pr.outputs.pr_number }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number — skipping Claude review wait"
+            echo "review_done=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Waiting for Claude Code Review check on PR #${PR_NUMBER}..."
+          TIMEOUT=600  # 10 minutes
+          ELAPSED=0
+          INTERVAL=15
+
+          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+            # Check if the claude-review check has completed
+            STATUS=$(gh pr checks "$PR_NUMBER" --json name,state \
+              --jq '.[] | select(.name == "Claude Code Review") | .state' 2>/dev/null || echo "PENDING")
+
+            if [ "$STATUS" = "SUCCESS" ] || [ "$STATUS" = "FAILURE" ]; then
+              echo "Claude review completed with status: ${STATUS}"
+              echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+              echo "review_done=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+
+            echo "Claude review status: ${STATUS} (${ELAPSED}s elapsed)"
+            sleep "$INTERVAL"
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+            echo "::warning::Claude review timed out after ${TIMEOUT}s"
+            echo "review_status=TIMEOUT" >> "$GITHUB_OUTPUT"
+            echo "review_done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Process Claude review comments and create issues
+        id: process-findings
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ needs.create-promotion-pr.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          HAS_BLOCKING=false
+          ISSUES_CREATED=0
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR — skipping finding processing"
+            echo "has_blocking=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get all review comments from Claude on this PR
+          COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "claude[bot]" or .user.type == "Bot") | {body: .body, path: .path, line: .line, url: .html_url}]' 2>/dev/null || echo "[]")
+
+          COMMENT_COUNT=$(echo "$COMMENTS" | jq 'length')
+          echo "Found ${COMMENT_COUNT} Claude review comment(s)"
+
+          # Also check PR review body comments
+          REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            --jq '[.[] | select(.user.login == "claude[bot]" or .user.type == "Bot") | {body: .body, url: .html_url}]' 2>/dev/null || echo "[]")
+
+          # Combine all comments
+          ALL_COMMENTS=$(echo "$COMMENTS $REVIEW_COMMENTS" | jq -s 'add // []')
+
+          # Parse [SEVERITY:CONFIDENCE] tags from each comment
+          echo "$ALL_COMMENTS" | jq -c '.[]' | while read -r comment; do
+            BODY=$(echo "$comment" | jq -r '.body // ""')
+            URL=$(echo "$comment" | jq -r '.url // ""')
+            FILE=$(echo "$comment" | jq -r '.path // "unknown"')
+            LINE=$(echo "$comment" | jq -r '.line // 0')
+
+            # Extract [SEVERITY:CONFIDENCE] tag
+            TAG=$(echo "$BODY" | grep -oE '\[(CRITICAL|HIGH|MEDIUM|LOW):[0-9]+\]' | head -1 || true)
+            if [ -z "$TAG" ]; then
+              continue
+            fi
+
+            SEVERITY=$(echo "$TAG" | sed 's/\[\(.*\):\(.*\)\]/\1/')
+            CONFIDENCE=$(echo "$TAG" | sed 's/\[\(.*\):\(.*\)\]/\2/')
+            # Strip tag from body for issue description
+            DESC=$(echo "$BODY" | sed "s/\[${SEVERITY}:${CONFIDENCE}\] *//" | head -5)
+
+            echo "Found: [${SEVERITY}:${CONFIDENCE}] in ${FILE}:${LINE}"
+
+            # Determine if this should create an issue (confidence matrix)
+            CREATE_ISSUE=false
+            case "$SEVERITY" in
+              CRITICAL) CREATE_ISSUE=true ;;  # Always
+              HIGH)     [ "$CONFIDENCE" -ge 50 ] && CREATE_ISSUE=true ;;
+              MEDIUM)   [ "$CONFIDENCE" -ge 80 ] && CREATE_ISSUE=true ;;
+              LOW)      [ "$CONFIDENCE" -ge 80 ] && CREATE_ISSUE=true ;;
+            esac
+
+            # Check if blocking (CRITICAL ≥80)
+            if [ "$SEVERITY" = "CRITICAL" ] && [ "$CONFIDENCE" -ge 80 ]; then
+              HAS_BLOCKING=true
+            fi
+
+            if [ "$CREATE_ISSUE" = "true" ]; then
+              # Determine labels
+              case "$SEVERITY" in
+                CRITICAL) LABELS="bug,risk: high,staging-ci-review" ;;
+                HIGH)     LABELS="bug,risk: medium,staging-ci-review" ;;
+                MEDIUM)   LABELS="risk: medium,staging-ci-review" ;;
+                LOW)      LABELS="risk: low,staging-ci-review" ;;
+              esac
+              if [ "$SEVERITY" = "CRITICAL" ] && [ "$CONFIDENCE" -lt 50 ]; then
+                LABELS="${LABELS},low-confidence"
+              fi
+
+              TITLE=$(echo "$DESC" | head -1 | cut -c1-80)
+              {
+                echo "## ${SEVERITY} Issue Found by Staging CI Review"
+                echo ""
+                echo "**Severity:** ${SEVERITY}"
+                echo "**Confidence:** ${CONFIDENCE}/100"
+                echo "**File:** \`${FILE}:${LINE}\`"
+                echo "**PR comment:** ${URL}"
+                echo ""
+                echo "### Description"
+                echo "$DESC"
+                echo ""
+                echo "---"
+                echo "*Auto-created by staging-ci Claude Code review*"
+              } > /tmp/issue-body.md
+
+              gh issue create \
+                --title "[${SEVERITY}] ${TITLE}" \
+                --body-file /tmp/issue-body.md \
+                --label "${LABELS}" || echo "::warning::Failed to create issue for ${SEVERITY} finding"
+              ISSUES_CREATED=$((ISSUES_CREATED + 1))
+            fi
+          done
+
+          echo "Created ${ISSUES_CREATED} issues"
+          echo "has_blocking=${HAS_BLOCKING}" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate gate
+        id: evaluate
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ needs.create-promotion-pr.outputs.pr_number }}
+        run: |
+          HAS_BLOCKING="${{ steps.process-findings.outputs.has_blocking }}"
+          SKIP_INPUT="${{ inputs.skip_claude_gate }}"
+
+          if [ "$HAS_BLOCKING" = "true" ]; then
+            echo "::warning::Claude review found blocking issues (CRITICAL ≥80 confidence)"
+            if [ "$SKIP_INPUT" = "true" ]; then
+              echo "::warning::Gate overridden by skip_claude_gate workflow input"
+              echo "passed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Blocking promotion due to CRITICAL findings (≥80 confidence)"
+              echo "::error::PR #${PR_NUMBER} left open with review comments"
+              echo "passed=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          else
+            echo "No blocking findings. Gate passed."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Merge the promotion PR
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Merging promotion PR #${PR_NUMBER}"
+            gh pr merge "$PR_NUMBER" --merge --auto || echo "::warning::Auto-merge failed for PR #${PR_NUMBER}"
+          fi
+
+  # ── Update tested tag on success ─────────────────────────────────
+  update-tag:
+    name: Update staging-tested tag
+    needs: [check-changes, gate]
+    if: >
+      always() &&
+      needs.check-changes.outputs.has_changes == 'true' &&
+      needs.gate.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: staging
+          fetch-depth: 1
+
+      - name: Update staging-tested tag
+        run: |
+          git tag -f staging-tested "${{ needs.check-changes.outputs.current_head }}"
+          git push origin staging-tested --force
+          echo "Updated staging-tested tag to ${{ needs.check-changes.outputs.current_head }}"
 
   # ── Report ───────────────────────────────────────────────────────
   report:
     name: Staging CI Summary
-    needs: [check-changes, tests, e2e, claude-review, claude-gate, update-tag, promote-to-main]
+    needs: [check-changes, tests, e2e, create-promotion-pr, gate, update-tag]
     if: always() && needs.check-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -256,9 +403,12 @@ jobs:
           echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Tests | ${{ needs.tests.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E | ${{ needs.e2e.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Claude Review | ${{ needs.claude-review.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Claude Gate | ${{ needs.claude-gate.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Promotion PR | ${{ needs.create-promotion-pr.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Gate | ${{ needs.gate.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Tag Updated | ${{ needs.update-tag.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Promoted to Main | ${{ needs.promote-to-main.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Range: ${{ needs.check-changes.outputs.diff_range }}" >> "$GITHUB_STEP_SUMMARY"
+          PR_NUM="${{ needs.create-promotion-pr.outputs.pr_number }}"
+          if [ -n "$PR_NUM" ]; then
+            echo "Promotion PR: #${PR_NUM}" >> "$GITHUB_STEP_SUMMARY"
+          fi
