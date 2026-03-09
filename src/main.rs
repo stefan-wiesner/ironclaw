@@ -214,29 +214,40 @@ async fn async_main() -> anyhow::Result<()> {
     // ── Orchestrator / container job manager ────────────────────────────
 
     // Proactive Docker detection
-    let docker_status = if config.sandbox.enabled {
+    let (docker_status, docker_user_warning) = if config.sandbox.enabled {
         let detection = ironclaw::sandbox::check_docker().await;
-        match detection.status {
+        let warning = match detection.status {
             ironclaw::sandbox::DockerStatus::Available => {
                 tracing::info!("Docker is available");
+                None
             }
             ironclaw::sandbox::DockerStatus::NotInstalled => {
+                let hint = detection.platform.install_hint();
                 tracing::warn!(
                     "Docker is not installed -- sandbox disabled for this session. {}",
-                    detection.platform.install_hint()
+                    hint
                 );
+                Some(format!(
+                    "Sandbox is enabled but Docker is not installed -- \
+                     full_job routines will fail until Docker is available. {hint}"
+                ))
             }
             ironclaw::sandbox::DockerStatus::NotRunning => {
+                let hint = detection.platform.start_hint();
                 tracing::warn!(
                     "Docker is installed but not running -- sandbox disabled for this session. {}",
-                    detection.platform.start_hint()
+                    hint
                 );
+                Some(format!(
+                    "Sandbox is enabled but Docker is not running -- \
+                     full_job routines will fail until Docker is started. {hint}"
+                ))
             }
-            ironclaw::sandbox::DockerStatus::Disabled => {}
-        }
-        detection.status
+            ironclaw::sandbox::DockerStatus::Disabled => None,
+        };
+        (detection.status, warning)
     } else {
-        ironclaw::sandbox::DockerStatus::Disabled
+        (ironclaw::sandbox::DockerStatus::Disabled, None)
     };
 
     let job_event_tx: Option<
@@ -684,6 +695,7 @@ async fn async_main() -> anyhow::Result<()> {
         sandbox_available: config.sandbox.enabled && docker_status.is_ok(),
     };
 
+    let channels_for_warnings = Arc::clone(&channels);
     let mut agent = Agent::new(
         config.agent.clone(),
         deps,
@@ -701,6 +713,25 @@ async fn async_main() -> anyhow::Result<()> {
     // Give the agent the routine engine slot so it can expose the engine to the gateway.
     if let Some(slot) = routine_engine_slot {
         agent.set_routine_engine_slot(slot);
+    }
+
+    // Notify user if sandbox is unavailable (Docker missing/not running)
+    if let Some(warning) = docker_user_warning {
+        let channels_ref = Arc::clone(&channels_for_warnings);
+        tokio::spawn(async move {
+            // Small delay to let channels finish connecting
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let response = ironclaw::channels::OutgoingResponse {
+                content: format!("Warning: {warning}"),
+                thread_id: None,
+                attachments: Vec::new(),
+                metadata: serde_json::json!({
+                    "source": "system",
+                    "type": "warning",
+                }),
+            };
+            let _ = channels_ref.broadcast_all("default", response).await;
+        });
     }
 
     agent.run().await?;
