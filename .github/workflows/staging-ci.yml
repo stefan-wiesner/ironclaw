@@ -274,14 +274,15 @@ jobs:
             --jq "${JQ_FILTER} | .html_url // empty" 2>/dev/null || echo "")
 
           if [ -z "$BODY" ]; then
-            echo "No actionable findings from Claude review on PR #${PR_NUMBER}"
-            echo "has_blocking=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Claude review comment found for PR #${PR_NUMBER} — treating as blocking"
+            echo "has_blocking=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Parse [SEVERITY:CONFIDENCE] tags from each numbered finding
           # Matrix: CRITICAL always→issue, ≥80→block. HIGH ≥50→issue. MEDIUM ≥80→issue. LOW ≥80→issue.
-          echo "$BODY" | grep -oE '\[(CRITICAL|HIGH|MEDIUM|LOW):[0-9]+\].*' | while read -r line; do
+          # Use process substitution so variables propagate to parent shell
+          while read -r line; do
             TAG=$(echo "$line" | grep -oE '^\[(CRITICAL|HIGH|MEDIUM|LOW):[0-9]+\]')
             SEVERITY=$(echo "$TAG" | sed 's/\[\(.*\):\(.*\)\]/\1/')
             CONFIDENCE=$(echo "$TAG" | sed 's/\[\(.*\):\(.*\)\]/\2/')
@@ -291,7 +292,7 @@ jobs:
 
             # Check if blocking (CRITICAL ≥80)
             if [ "$SEVERITY" = "CRITICAL" ] && [ "$CONFIDENCE" -ge 80 ]; then
-              echo "blocking=true" >> /tmp/staging-ci-blocking
+              HAS_BLOCKING=true
             fi
 
             # Determine if this should create an issue
@@ -332,12 +333,7 @@ jobs:
                 --label "${LABELS}" || echo "::warning::Failed to create issue for ${SEVERITY} finding"
               ISSUES_CREATED=$((ISSUES_CREATED + 1))
             fi
-          done
-
-          # Check if any finding was blocking (written by subshell via file)
-          if [ -f /tmp/staging-ci-blocking ]; then
-            HAS_BLOCKING=true
-          fi
+          done < <(echo "$BODY" | grep -oE '\[(CRITICAL|HIGH|MEDIUM|LOW):[0-9]+\].*')
 
           echo "Created ${ISSUES_CREATED} issues"
           echo "has_blocking=${HAS_BLOCKING}" >> "$GITHUB_OUTPUT"
