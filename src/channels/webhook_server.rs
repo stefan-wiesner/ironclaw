@@ -128,39 +128,103 @@ mod tests {
 
     #[tokio::test]
     async fn test_restart_with_addr_rebinds_listener() {
-        // Start on port 0 (OS assigns after bind)
-        let addr1 = "127.0.0.1:0".parse().unwrap();
+        use std::net::TcpListener as StdTcpListener;
+
+        // Find two available ports by binding and immediately closing
+        let port1 = {
+            let listener =
+                StdTcpListener::bind("127.0.0.1:0").expect("Failed to find available port 1");
+            listener
+                .local_addr()
+                .expect("Failed to get local addr")
+                .port()
+        };
+
+        let port2 = {
+            let listener =
+                StdTcpListener::bind("127.0.0.1:0").expect("Failed to find available port 2");
+            listener
+                .local_addr()
+                .expect("Failed to get local addr")
+                .port()
+        };
+
+        assert_ne!(port1, port2, "Should have different ports");
+        assert_ne!(port1, 0, "Port 1 should be non-zero");
+        assert_ne!(port2, 0, "Port 2 should be non-zero");
+
+        // Start server on first port
+        let addr1 = format!("127.0.0.1:{}", port1).parse().unwrap();
         let mut server = WebhookServer::new(WebhookServerConfig { addr: addr1 });
 
-        // Create a simple test router
+        // Create a test router that responds to health checks
         let test_router = axum::Router::new().route(
-            "/test",
-            axum::routing::get(|| async { Json(json!({"ok": true})) }),
+            "/health",
+            axum::routing::get(|| async { Json(json!({"status": "ok"})) }),
         );
         server.add_routes(test_router);
 
-        // Start the server
+        // Start the server on first port
         server.start().await.expect("Failed to start server");
+        assert_eq!(
+            server.current_addr(),
+            addr1,
+            "Server should be bound to initial address"
+        );
 
-        // Allow a brief moment for the listener to bind and OS to assign port
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Verify the first server is actually listening
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{}/health", addr1))
+            .send()
+            .await
+            .expect("Failed to send request to first server");
+        assert_eq!(
+            response.status(),
+            200,
+            "First server should respond to health check"
+        );
 
-        let old_addr = server.current_addr();
-        // Note: port may still be 0 until OS actually binds, but the server is listening
-        tracing::debug!("Server started on {}", old_addr);
-
-        // Restart on a new addr (OS will assign new port)
-        let addr2 = "127.0.0.1:0".parse().unwrap();
+        // Restart on second port
+        let addr2 = format!("127.0.0.1:{}", port2).parse().unwrap();
         server
             .restart_with_addr(addr2)
             .await
             .expect("Failed to restart with new addr");
 
-        // Allow a brief moment for the new listener to bind
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Assert the address changed
+        assert_eq!(
+            server.current_addr(),
+            addr2,
+            "Server address should be updated after restart"
+        );
+        assert_ne!(
+            addr1, addr2,
+            "Address should change after restart_with_addr"
+        );
 
-        let new_addr = server.current_addr();
-        tracing::debug!("Server restarted on {}", new_addr);
+        // Verify the new server is actually listening on the new address
+        let response = client
+            .get(format!("http://{}/health", addr2))
+            .send()
+            .await
+            .expect("Failed to send request to restarted server");
+        assert_eq!(
+            response.status(),
+            200,
+            "Restarted server should respond to health check on new address"
+        );
+
+        // Verify the old address is no longer responding
+        let old_result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.get(format!("http://{}/health", addr1)).send(),
+        )
+        .await;
+        assert!(
+            old_result.is_err() || old_result.as_ref().unwrap().is_err(),
+            "Old address should not respond after server restarts"
+        );
 
         // Clean up
         server.shutdown().await;
