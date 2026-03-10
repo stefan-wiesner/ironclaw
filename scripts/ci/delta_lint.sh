@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Delta lint: only fail on clippy warnings/errors that touch changed lines.
-# Compares the current branch against the merge base with origin/main.
+# Compares the current branch against the merge base with the upstream default branch.
 
 CLIPPY_OUT=""
 DIFF_OUT=""
@@ -18,8 +18,26 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
+# Determine the upstream base ref dynamically
+BASE_REF=""
+# Try the remote HEAD symbolic ref (works for any default branch name)
+if [ -z "$BASE_REF" ]; then
+    BASE_REF=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/||' || true)
+fi
+# Fall back to common default branch names
+if [ -z "$BASE_REF" ] && git rev-parse --verify origin/main &>/dev/null; then
+    BASE_REF="origin/main"
+fi
+if [ -z "$BASE_REF" ] && git rev-parse --verify origin/master &>/dev/null; then
+    BASE_REF="origin/master"
+fi
+if [ -z "$BASE_REF" ]; then
+    echo "WARNING: could not determine upstream base branch, skipping delta lint"
+    exit 0
+fi
+
 # Compute merge base
-BASE=$(git merge-base origin/main HEAD)
+BASE=$(git merge-base "$BASE_REF" HEAD)
 
 # Find changed .rs files
 CHANGED_RS=$(git diff --name-only "$BASE" -- '*.rs' || true)
