@@ -12,7 +12,7 @@ use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
 
 // ── Encryption keys ──────────────────────────────────────────────────────
 
-/// 32-byte hex key for `SecretsCrypto::new()` in tests.
+/// 32-character key string for `SecretsCrypto::new()` in tests.
 pub const TEST_CRYPTO_KEY: &str = "0123456789abcdef0123456789abcdef";
 
 /// 32+ char key for web gateway `SecretsCrypto` in tests.
