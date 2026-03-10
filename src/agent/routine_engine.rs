@@ -219,7 +219,7 @@ impl RoutineEngine {
 
             let mut matched = true;
             for (key, expected) in filters {
-                let Some(actual) = payload.get(key).and_then(json_value_as_string) else {
+                let Some(actual) = payload.get(key).and_then(crate::agent::routine::json_value_as_filter_string) else {
                     tracing::debug!(routine = %routine.name, filter_key = %key, "Filter key not found in payload");
                     matched = false;
                     break;
@@ -1136,15 +1136,6 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let end = crate::util::floor_char_boundary(s, max);
         format!("{}...", &s[..end])
-    }
-}
-
-fn json_value_as_string(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
     }
 }
 
