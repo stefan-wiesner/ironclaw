@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ironclaw::safety::{LeakDetector, Sanitizer, Validator};
 
 fn bench_sanitizer(c: &mut Criterion) {
@@ -110,5 +110,10 @@ fn bench_leak_detector(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sanitizer, bench_validator, bench_leak_detector);
+criterion_group!(
+    benches,
+    bench_sanitizer,
+    bench_validator,
+    bench_leak_detector
+);
 criterion_main!(benches);
