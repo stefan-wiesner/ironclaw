@@ -233,16 +233,15 @@ impl Channel for RelayChannel {
                         "Relay: received message from {}", provider_str
                     );
 
-                    let msg =
-                        IncomingMessage::new(&relay_name, &event.sender_id, event.text())
-                            .with_user_name(event.display_name())
-                            .with_metadata(serde_json::json!({
-                                "team_id": event.team_id(),
-                                "channel_id": event.channel_id,
-                                "sender_id": event.sender_id,
-                                "thread_id": event.thread_id,
-                                "provider": event.provider,
-                            }));
+                    let msg = IncomingMessage::new(&relay_name, &event.sender_id, event.text())
+                        .with_user_name(event.display_name())
+                        .with_metadata(serde_json::json!({
+                            "team_id": event.team_id(),
+                            "channel_id": event.channel_id,
+                            "sender_id": event.sender_id,
+                            "thread_id": event.thread_id,
+                            "provider": event.provider,
+                        }));
 
                     let msg = if let Some(ref thread_id) = event.thread_id {
                         msg.with_thread(thread_id)

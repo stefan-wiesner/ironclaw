@@ -84,7 +84,6 @@ pub struct Connection {
     pub connected: bool,
 }
 
-
 /// HTTP client for the channel-relay service.
 #[derive(Clone)]
 pub struct RelayClient {

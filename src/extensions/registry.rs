@@ -435,7 +435,6 @@ pub fn builtin_entries() -> Vec<RegistryEntry> {
             auth_hint: AuthHint::ChannelRelayOAuth,
             version: None,
         });
-
     }
 
     entries
