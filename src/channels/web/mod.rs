@@ -15,6 +15,8 @@
 //! ```
 
 pub mod auth;
+pub mod gateway_protocol;
+pub mod gateway_ws;
 pub(crate) mod handlers;
 pub mod log_layer;
 pub mod openai_compat;
