@@ -1,5 +1,6 @@
 ---
 source: src/cli/mod.rs
+assertion_line: 265
 expression: help
 ---
 IronClaw is a secure AI assistant. Use 'ironclaw <subcommand> --help' for details.
@@ -13,6 +14,7 @@ Commands:
   run         Run the AI agent
   onboard     Run interactive setup wizard
   config      Manage app configs
+  bootstrap   Bootstrap the system non-interactively
   tool        Manage WASM tools
   registry    Browse/install extensions
   mcp         Manage MCP servers

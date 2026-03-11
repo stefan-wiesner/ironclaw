@@ -1,5 +1,6 @@
 ---
 source: src/cli/mod.rs
+assertion_line: 258
 expression: help
 ---
 Secure personal AI assistant that protects your data and expands its capabilities
@@ -10,6 +11,7 @@ Commands:
   run         Run the AI agent
   onboard     Run interactive setup wizard
   config      Manage app configs
+  bootstrap   Bootstrap the system non-interactively
   tool        Manage WASM tools
   registry    Browse/install extensions
   mcp         Manage MCP servers
