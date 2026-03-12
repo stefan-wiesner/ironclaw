@@ -15,6 +15,7 @@
 mod channels;
 mod completion;
 mod config;
+mod bootstrap;
 mod doctor;
 #[cfg(feature = "import")]
 pub mod import;
@@ -30,6 +31,7 @@ mod tool;
 
 pub use channels::{ChannelsCommand, run_channels_command};
 pub use completion::Completion;
+pub use bootstrap::{BootstrapCommand, run_bootstrap_command};
 pub use config::{ConfigCommand, run_config_command};
 pub use doctor::run_doctor_command;
 #[cfg(feature = "import")]
@@ -119,9 +121,18 @@ pub enum Command {
     #[command(
         subcommand,
         about = "Manage app configs",
-        long_about = "Commands for listing, getting, and setting configurations.\nExample: ironclaw config list"
+        long_about = "Commands for listing, getting, and setting configurations.
+Example: ironclaw config list"
     )]
     Config(ConfigCommand),
+
+    /// Headless bootstrap command for migrations and tool installation
+    #[command(
+        about = "Bootstrap the system non-interactively",
+        long_about = "Runs database migrations and installs/authenticates tools non-interactively.
+Example: ironclaw bootstrap --tools tool1,tool2 --auth-tools tool1"
+    )]
+    Bootstrap(BootstrapCommand),
 
     /// Manage WASM tools
     #[command(

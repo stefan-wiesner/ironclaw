@@ -219,6 +219,8 @@ pub async fn start_server(
         .route("/api/chat/auth-cancel", post(chat_auth_cancel_handler))
         .route("/api/chat/events", get(chat_events_handler))
         .route("/api/chat/ws", get(chat_ws_handler))
+        // Gateway protocol (Paperclip adapter)
+        .route("/api/gateway/ws", get(gateway_ws_handler))
         .route("/api/chat/history", get(chat_history_handler))
         .route("/api/chat/threads", get(chat_threads_handler))
         .route("/api/chat/thread/new", post(chat_new_thread_handler))
@@ -1179,6 +1181,46 @@ async fn chat_ws_handler(
         ));
     }
     Ok(ws.on_upgrade(move |socket| crate::channels::web::ws::handle_ws_connection(socket, state)))
+}
+
+/// Gateway protocol WebSocket handler for Paperclip adapter compatibility.
+///
+/// This endpoint implements the gateway protocol with challenge handshake
+/// expected by the Paperclip ironclaw-gateway adapter.
+async fn gateway_ws_handler(
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Validate Origin header to prevent cross-site WebSocket hijacking.
+    let origin = headers
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "WebSocket Origin header required".to_string(),
+            )
+        })?;
+
+    // Extract the host from the origin and compare exactly.
+    let host = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .and_then(|rest| rest.split(':').next()?.split('/').next())
+        .unwrap_or("");
+
+    let is_local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+    if !is_local {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "WebSocket origin not allowed".to_string(),
+        ));
+    }
+
+    Ok(ws.on_upgrade(move |socket| {
+        crate::channels::web::gateway_ws::handle_gateway_ws_connection(socket, state)
+    }))
 }
 
 #[derive(Deserialize)]

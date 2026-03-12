@@ -113,7 +113,7 @@ mod tests {
             .build()
             .await;
 
-        rig.send_message("Write a file to a bad path then recover")
+        rig.send_message("write a file to a bad path then recover")
             .await;
         let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
 

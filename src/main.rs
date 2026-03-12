@@ -153,6 +153,10 @@ async fn async_main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some(Command::Bootstrap(bootstrap_cmd)) => {
+            init_cli_tracing();
+            return ironclaw::cli::run_bootstrap_command(bootstrap_cmd.clone()).await;
+        }
         None | Some(Command::Run) => {
             // Continue to run agent
         }
