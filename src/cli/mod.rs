@@ -8,36 +8,45 @@
 //! - Managing MCP servers (`mcp add`, `mcp auth`, `mcp list`, `mcp test`)
 //! - Querying workspace memory (`memory search`, `memory read`, `memory write`)
 //! - Managing OS service (`service install`, `service start`, `service stop`)
+//! - Listing configured channels (`channels list`)
 //! - Active health diagnostics (`doctor`)
 //! - Checking system health (`status`)
 
+mod channels;
 mod completion;
 mod config;
 mod bootstrap;
 mod doctor;
+#[cfg(feature = "import")]
+pub mod import;
 mod mcp;
 pub mod memory;
 pub mod oauth_defaults;
 mod pairing;
 mod registry;
 mod service;
+mod skills;
 pub mod status;
 mod tool;
 
+pub use channels::{ChannelsCommand, run_channels_command};
 pub use completion::Completion;
 pub use bootstrap::{BootstrapCommand, run_bootstrap_command};
 pub use config::{ConfigCommand, run_config_command};
 pub use doctor::run_doctor_command;
+#[cfg(feature = "import")]
+pub use import::{ImportCommand, run_import_command};
 pub use mcp::{McpCommand, run_mcp_command};
 pub use memory::MemoryCommand;
-#[cfg(feature = "postgres")]
-pub use memory::run_memory_command;
 pub use memory::run_memory_command_with_db;
 pub use pairing::{PairingCommand, run_pairing_command, run_pairing_command_with_store};
 pub use registry::{RegistryCommand, run_registry_command};
 pub use service::{ServiceCommand, run_service_command};
+pub use skills::{SkillsCommand, run_skills_command};
 pub use status::run_status_command;
 pub use tool::{ToolCommand, run_tool_command};
+
+use std::sync::Arc;
 
 use clap::{ColorChoice, Parser, Subcommand};
 
@@ -96,12 +105,16 @@ pub enum Command {
         skip_auth: bool,
 
         /// Reconfigure channels only
-        #[arg(long, conflicts_with = "provider_only")]
+        #[arg(long, conflicts_with_all = ["provider_only", "quick"])]
         channels_only: bool,
 
         /// Reconfigure LLM provider and model only
-        #[arg(long, conflicts_with = "channels_only")]
+        #[arg(long, conflicts_with_all = ["channels_only", "quick"])]
         provider_only: bool,
+
+        /// Quick setup: auto-defaults everything except LLM provider and model
+        #[arg(long, conflicts_with_all = ["channels_only", "provider_only"])]
+        quick: bool,
     },
 
     /// Manage configuration settings
@@ -137,6 +150,14 @@ Example: ironclaw bootstrap --tools tool1,tool2 --auth-tools tool1"
     )]
     Registry(RegistryCommand),
 
+    /// List and inspect messaging channels
+    #[command(
+        subcommand,
+        about = "Manage channels",
+        long_about = "List configured messaging channels.\nExamples:\n  ironclaw channels list\n  ironclaw channels list --verbose\n  ironclaw channels list --json"
+    )]
+    Channels(ChannelsCommand),
+
     /// Manage MCP servers (hosted tool providers)
     #[command(
         subcommand,
@@ -169,6 +190,14 @@ Example: ironclaw bootstrap --tools tool1,tool2 --auth-tools tool1"
     )]
     Service(ServiceCommand),
 
+    /// Manage SKILL.md-based skills
+    #[command(
+        subcommand,
+        about = "Manage skills",
+        long_about = "List, search, and inspect SKILL.md-based skills.\nExamples:\n  ironclaw skills list\n  ironclaw skills search 'writing'\n  ironclaw skills info my-skill"
+    )]
+    Skills(SkillsCommand),
+
     /// Probe external dependencies and validate configuration
     #[command(
         about = "Run diagnostics",
@@ -189,6 +218,15 @@ Example: ironclaw bootstrap --tools tool1,tool2 --auth-tools tool1"
         long_about = "Generates shell completion scripts.\nExample: ironclaw completion --shell bash > ironclaw.bash"
     )]
     Completion(Completion),
+
+    /// Import data from other AI systems
+    #[cfg(feature = "import")]
+    #[command(
+        subcommand,
+        about = "Import from other AI systems",
+        long_about = "Migrate data from other AI assistants like OpenClaw.\nExample: ironclaw import openclaw"
+    )]
+    Import(ImportCommand),
 
     /// Run as a sandboxed worker inside a Docker container (internal use).
     /// This is invoked automatically by the orchestrator, not by users directly.
@@ -236,6 +274,43 @@ impl Cli {
     }
 }
 
+/// Initialize a secrets store from environment config.
+///
+/// Shared helper for CLI subcommands (`mcp auth`, `tool auth`, etc.) that need
+/// access to encrypted secrets without spinning up the full AppBuilder.
+pub async fn init_secrets_store()
+-> anyhow::Result<Arc<dyn crate::secrets::SecretsStore + Send + Sync>> {
+    let config = crate::config::Config::from_env().await?;
+    let master_key = config.secrets.master_key().ok_or_else(|| {
+        anyhow::anyhow!(
+            "SECRETS_MASTER_KEY not set. Run 'ironclaw onboard' first or set it in .env"
+        )
+    })?;
+
+    let crypto = Arc::new(crate::secrets::SecretsCrypto::new(master_key.clone())?);
+
+    Ok(crate::db::create_secrets_store(&config.database, crypto).await?)
+}
+
+/// Run the Memory CLI subcommand.
+pub async fn run_memory_command(mem_cmd: &MemoryCommand) -> anyhow::Result<()> {
+    let config = crate::config::Config::from_env()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let session = crate::llm::create_session_manager(config.llm.session.clone()).await;
+
+    let embeddings = config
+        .embeddings
+        .create_provider(&config.llm.nearai.base_url, session);
+
+    let db: Arc<dyn crate::db::Database> = crate::db::connect_from_config(&config.database)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    run_memory_command_with_db(mem_cmd.clone(), db, embeddings).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "import")]
     fn test_help_output() {
         let mut cmd = Cli::command();
         let help = cmd.render_help().to_string();
@@ -259,7 +335,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "import"))]
+    fn test_help_output_without_import() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert_snapshot!(help);
+    }
+
+    #[test]
+    #[cfg(feature = "import")]
     fn test_long_help_output() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert_snapshot!(help);
+    }
+
+    #[test]
+    #[cfg(not(feature = "import"))]
+    fn test_long_help_output_without_import() {
         let mut cmd = Cli::command();
         let help = cmd.render_long_help().to_string();
         assert_snapshot!(help);

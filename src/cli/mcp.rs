@@ -10,11 +10,12 @@ use clap::{Args, Subcommand};
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::secrets::{SecretsCrypto, SecretsStore};
+use crate::secrets::SecretsStore;
 use crate::tools::mcp::{
-    McpClient, McpServerConfig, McpSessionManager, OAuthConfig,
+    McpClient, McpProcessManager, McpServerConfig, McpSessionManager, OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
+    factory::create_client_from_config,
 };
 
 /// Arguments for the `mcp add` subcommand.
@@ -494,7 +495,7 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
 
     let client = if has_tokens {
         // We have stored tokens, use authenticated client
-        McpClient::new_authenticated(server.clone(), session_manager, secrets, user_id)
+        McpClient::new_authenticated(server.clone(), session_manager.clone(), secrets, user_id)
     } else if server.requires_auth() {
         // OAuth configured but no tokens - need to authenticate
         println!();
@@ -505,8 +506,17 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
         println!();
         return Ok(());
     } else {
-        // No OAuth and no tokens - try unauthenticated
-        McpClient::new_with_config(server.clone())
+        // Use the factory to dispatch on transport type (HTTP, stdio, unix)
+        let process_manager = Arc::new(McpProcessManager::new());
+        create_client_from_config(
+            server.clone(),
+            &session_manager,
+            &process_manager,
+            None,
+            "default",
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?
     };
 
     // Test connection
@@ -628,17 +638,7 @@ async fn save_servers(
 
 /// Initialize and return the secrets store.
 async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Sync>> {
-    let config = Config::from_env().await?;
-
-    let master_key = config.secrets.master_key().ok_or_else(|| {
-        anyhow::anyhow!(
-            "SECRETS_MASTER_KEY not set. Run 'ironclaw onboard' first or set it in .env"
-        )
-    })?;
-
-    let crypto = Arc::new(SecretsCrypto::new(master_key.clone())?);
-
-    Ok(crate::db::create_secrets_store(&config.database, crypto).await?)
+    crate::cli::init_secrets_store().await
 }
 
 #[cfg(test)]
