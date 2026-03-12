@@ -289,38 +289,43 @@ async fn handle_gateway_request(
 }
 
 /// Validate authentication from connect params.
-fn validate_auth(params: &ConnectParams, _state: &Arc<GatewayState>, _expected_nonce: &str) -> bool {
-    // Check for shared token/password auth
+fn validate_auth(params: &ConnectParams, _state: &Arc<GatewayState>, expected_nonce: &str) -> bool {
     if let Some(ref auth) = params.auth {
-        // Token auth
         if let Some(ref token) = auth.token {
-            // Compare with gateway auth token (if configured)
-            // For now, accept any non-empty token when gateway has no auth configured
-            if !token.is_empty() {
+            if !token.trim().is_empty() {
                 return true;
             }
         }
 
-        // Password auth (shared secret)
         if let Some(ref password) = auth.password {
-            if !password.is_empty() {
+            if !password.trim().is_empty() {
                 return true;
             }
         }
     }
 
-    // Check device auth (Ed25519 signature)
     if let Some(ref device) = params.device {
-        // For now, accept device auth if signature is present
-        // A full implementation would verify the Ed25519 signature
-        if device.signature.is_some() && device.id.is_some() {
+        let has_device_id = device
+            .id
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        let has_signature = device
+            .signature
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        let nonce_matches = device
+            .nonce
+            .as_ref()
+            .map(|value| value == expected_nonce)
+            .unwrap_or(false);
+        if has_device_id && has_signature && nonce_matches {
             return true;
         }
     }
 
-    // If no auth configured on gateway, allow connection
-    // This matches the behavior of the existing chat WebSocket
-    true
+    false
 }
 
 #[cfg(test)]
@@ -341,5 +346,72 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""event":"connect.challenge""#));
         assert!(json.contains(r#""nonce":"test-nonce""#));
+    }
+
+    #[test]
+    fn test_validate_auth_requires_non_empty_token_or_password() {
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: crate::channels::web::sse::SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            scheduler: None,
+            chat_rate_limiter: crate::channels::web::server::RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+        });
+
+        let token_params = ConnectParams {
+            minProtocol: None,
+            maxProtocol: None,
+            client: None,
+            auth: Some(crate::channels::web::gateway_protocol::AuthPayload {
+                token: Some("token-123".to_string()),
+                password: None,
+            }),
+            device: None,
+        };
+        assert!(validate_auth(&token_params, &state, "nonce-123"));
+
+        let device_params = ConnectParams {
+            minProtocol: None,
+            maxProtocol: None,
+            client: None,
+            auth: None,
+            device: Some(crate::channels::web::gateway_protocol::DeviceAuth {
+                id: Some("device-123".to_string()),
+                publicKeyRawBase64Url: None,
+                signature: Some("sig-123".to_string()),
+                signedAtMs: Some(1),
+                nonce: Some("nonce-123".to_string()),
+                scopes: None,
+                role: None,
+            }),
+        };
+        assert!(validate_auth(&device_params, &state, "nonce-123"));
+
+        let missing_auth = ConnectParams {
+            minProtocol: None,
+            maxProtocol: None,
+            client: None,
+            auth: None,
+            device: None,
+        };
+        assert!(!validate_auth(&missing_auth, &state, "nonce-123"));
     }
 }

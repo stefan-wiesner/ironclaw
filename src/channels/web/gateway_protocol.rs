@@ -207,9 +207,12 @@ pub struct AuthPayload {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceAuth {
     pub id: Option<String>,
+    #[serde(alias = "publicKey")]
     pub publicKeyRawBase64Url: Option<String>,
     pub signature: Option<String>,
+    #[serde(alias = "signedAt")]
     pub signedAtMs: Option<i64>,
+    pub nonce: Option<String>,
     pub scopes: Option<Vec<String>>,
     pub role: Option<String>,
 }
