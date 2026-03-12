@@ -61,16 +61,19 @@ async fn connect_gateway_ws(
     addr: SocketAddr,
     include_http_auth: bool,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let url = if include_http_auth {
-        format!("ws://{}/api/gateway/ws?token={}", addr, AUTH_TOKEN)
-    } else {
-        format!("ws://{}/api/gateway/ws", addr)
-    };
+    let ws_scheme = "ws";
+    let url = format!("{}://{}/api/gateway/ws", ws_scheme, addr);
     let mut request = url.into_client_request().unwrap();
     request.headers_mut().insert(
         "Origin",
         format!("http://127.0.0.1:{}", addr.port()).parse().unwrap(),
     );
+    if include_http_auth {
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", AUTH_TOKEN).parse().unwrap(),
+        );
+    }
     let (stream, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("failed to connect websocket");
@@ -259,7 +262,8 @@ async fn test_gateway_agent_request_reaches_agent_loop_and_wait_succeeds() {
 #[tokio::test]
 async fn test_gateway_websocket_requires_http_auth() {
     let (addr, _state, _agent_rx) = start_test_server().await;
-    let url = format!("ws://{}/api/gateway/ws", addr);
+    let ws_scheme = "ws";
+    let url = format!("{}://{}/api/gateway/ws", ws_scheme, addr);
     let mut request = url.into_client_request().unwrap();
     request.headers_mut().insert(
         "Origin",
