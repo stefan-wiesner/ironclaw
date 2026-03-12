@@ -30,8 +30,8 @@ use crate::setup::channels::{
     SecretsContext, setup_http, setup_signal, setup_tunnel, setup_wasm_channel,
 };
 use crate::setup::prompts::{
-    confirm, input, optional_input, print_error, print_header, print_info, print_step,
-    print_success, secret_input, select_many, select_one,
+    confirm, input, optional_input, print_banner, print_error, print_header, print_info,
+    print_step, print_success, secret_input, select_many, select_one,
 };
 
 // unused const, keep commented for clarity / future use
@@ -76,6 +76,8 @@ pub struct SetupConfig {
     pub channels_only: bool,
     /// Only reconfigure LLM provider and model selection.
     pub provider_only: bool,
+    /// Quick setup: auto-defaults everything except LLM provider and model.
+    pub quick: bool,
 }
 
 /// Interactive setup wizard for IronClaw.
@@ -139,6 +141,7 @@ impl SetupWizard {
     /// settings are loaded from the database after Step 1 establishes a
     /// connection, so users don't have to re-enter everything.
     pub async fn run(&mut self) -> Result<(), SetupError> {
+        print_banner();
         print_header("IronClaw Setup Wizard");
 
         if self.config.channels_only {
@@ -154,6 +157,26 @@ impl SetupWizard {
             print_step(1, 2, "Inference Provider");
             self.step_inference_provider().await?;
             self.persist_after_step().await;
+            print_step(2, 2, "Model Selection");
+            self.step_model_selection().await?;
+            self.persist_after_step().await;
+        } else if self.config.quick {
+            // Quick mode: auto-default database + security, only ask for
+            // LLM provider + model. Designed for first-run experience.
+            self.auto_setup_database().await?;
+
+            // Load existing settings from DB (if any prior partial run)
+            let step1_settings = self.settings.clone();
+            self.try_load_existing_settings().await;
+            self.settings.merge_from(&step1_settings);
+
+            self.auto_setup_security().await?;
+            self.persist_after_step().await;
+
+            print_step(1, 2, "Inference Provider");
+            self.step_inference_provider().await?;
+            self.persist_after_step().await;
+
             print_step(2, 2, "Model Selection");
             self.step_model_selection().await?;
             self.persist_after_step().await;
@@ -659,7 +682,10 @@ impl SetupWizard {
             use refinery::embed_migrations;
             embed_migrations!("migrations");
 
-            print_info("Running migrations...");
+            if !self.config.quick {
+                print_info("Running migrations...");
+            }
+            tracing::debug!("Running PostgreSQL migrations...");
 
             let mut client = pool
                 .get()
@@ -671,7 +697,10 @@ impl SetupWizard {
                 .await
                 .map_err(|e| SetupError::Database(format!("Migration failed: {}", e)))?;
 
-            print_success("Migrations applied");
+            if !self.config.quick {
+                print_success("Migrations applied");
+            }
+            tracing::debug!("PostgreSQL migrations applied");
         }
         Ok(())
     }
@@ -682,14 +711,20 @@ impl SetupWizard {
         if let Some(ref backend) = self.db_backend {
             use crate::db::Database;
 
-            print_info("Running migrations...");
+            if !self.config.quick {
+                print_info("Running migrations...");
+            }
+            tracing::debug!("Running libSQL migrations...");
 
             backend
                 .run_migrations()
                 .await
                 .map_err(|e| SetupError::Database(format!("Migration failed: {}", e)))?;
 
-            print_success("Migrations applied");
+            if !self.config.quick {
+                print_success("Migrations applied");
+            }
+            tracing::debug!("libSQL migrations applied");
         }
         Ok(())
     }
@@ -804,6 +839,140 @@ impl SetupWizard {
         Ok(())
     }
 
+    /// Auto-setup database with zero prompts (quick mode).
+    ///
+    /// Uses existing env vars if present, otherwise defaults to libsql at the
+    /// standard path. Falls back to the interactive `step_database()` only when
+    /// just the postgres feature is compiled (can't auto-default postgres).
+    async fn auto_setup_database(&mut self) -> Result<(), SetupError> {
+        // If DATABASE_URL or LIBSQL_PATH already set, respect existing config
+        #[cfg(feature = "postgres")]
+        let env_backend = std::env::var("DATABASE_BACKEND").ok();
+
+        #[cfg(feature = "postgres")]
+        if let Some(ref backend) = env_backend
+            && (backend == "postgres" || backend == "postgresql")
+        {
+            if let Ok(url) = std::env::var("DATABASE_URL") {
+                print_info("Using existing PostgreSQL configuration");
+                self.settings.database_backend = Some("postgres".to_string());
+                self.settings.database_url = Some(url);
+                return Ok(());
+            }
+            // Postgres configured but no URL — fall through to interactive
+            return self.step_database().await;
+        }
+
+        #[cfg(feature = "postgres")]
+        if let Ok(url) = std::env::var("DATABASE_URL") {
+            print_info("Using existing PostgreSQL configuration");
+            self.settings.database_backend = Some("postgres".to_string());
+            self.settings.database_url = Some(url);
+            return Ok(());
+        }
+
+        // Auto-default to libsql if the feature is compiled
+        #[cfg(feature = "libsql")]
+        {
+            self.settings.database_backend = Some("libsql".to_string());
+
+            let existing_path = std::env::var("LIBSQL_PATH")
+                .ok()
+                .or_else(|| self.settings.libsql_path.clone());
+
+            let db_path = existing_path.unwrap_or_else(|| {
+                crate::config::default_libsql_path()
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+            let turso_url = std::env::var("LIBSQL_URL").ok();
+            let turso_token = std::env::var("LIBSQL_AUTH_TOKEN").ok();
+
+            self.test_database_connection_libsql(
+                &db_path,
+                turso_url.as_deref(),
+                turso_token.as_deref(),
+            )
+            .await?;
+
+            self.run_migrations_libsql().await?;
+
+            self.settings.libsql_path = Some(db_path.clone());
+            if let Some(url) = turso_url {
+                self.settings.libsql_url = Some(url);
+            }
+
+            print_success(&format!("Using embedded database at {}", db_path));
+            return Ok(());
+        }
+
+        // Only postgres feature compiled — can't auto-default, use interactive
+        #[allow(unreachable_code)]
+        {
+            self.step_database().await
+        }
+    }
+
+    /// Auto-setup security with zero prompts (quick mode).
+    ///
+    /// Silently configures the master key: uses existing env var or keychain
+    /// key if available, otherwise generates and stores one automatically
+    /// (keychain on macOS, env var fallback).
+    async fn auto_setup_security(&mut self) -> Result<(), SetupError> {
+        // Check env var first
+        if std::env::var("SECRETS_MASTER_KEY").is_ok() {
+            self.settings.secrets_master_key_source = KeySource::Env;
+            print_success("Security configured (env var)");
+            return Ok(());
+        }
+
+        // Try existing keychain key (no prompts — get_master_key may show
+        // OS dialogs on macOS, but that's unavoidable for keychain access)
+        if let Ok(keychain_key_bytes) = crate::secrets::keychain::get_master_key().await {
+            let key_hex: String = keychain_key_bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            self.secrets_crypto = Some(Arc::new(
+                SecretsCrypto::new(SecretString::from(key_hex))
+                    .map_err(|e| SetupError::Config(e.to_string()))?,
+            ));
+            self.settings.secrets_master_key_source = KeySource::Keychain;
+            print_success("Security configured (keychain)");
+            return Ok(());
+        }
+
+        // No existing key — generate one
+        // Try keychain first (preferred on macOS)
+        let key = crate::secrets::keychain::generate_master_key();
+        if crate::secrets::keychain::store_master_key(&key)
+            .await
+            .is_ok()
+        {
+            let key_hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+            self.secrets_crypto = Some(Arc::new(
+                SecretsCrypto::new(SecretString::from(key_hex))
+                    .map_err(|e| SetupError::Config(e.to_string()))?,
+            ));
+            self.settings.secrets_master_key_source = KeySource::Keychain;
+            print_success("Master key stored in OS keychain");
+            return Ok(());
+        }
+
+        // Keychain unavailable — fall back to env var mode
+        let key_hex = crate::secrets::keychain::generate_master_key_hex();
+        self.secrets_crypto = Some(Arc::new(
+            SecretsCrypto::new(SecretString::from(key_hex.clone()))
+                .map_err(|e| SetupError::Config(e.to_string()))?,
+        ));
+        crate::config::inject_single_var("SECRETS_MASTER_KEY", &key_hex);
+        self.settings.secrets_master_key_hex = Some(key_hex);
+        self.settings.secrets_master_key_source = KeySource::Env;
+        print_success("Master key stored in ~/.ironclaw/.env");
+        Ok(())
+    }
+
     /// Step 3: Inference provider selection.
     ///
     /// Uses the provider registry to dynamically build the selection menu.
@@ -913,7 +1082,7 @@ impl SetupWizard {
                 "Provider '{}' has no setup wizard. Configure via environment variables.",
                 provider_id
             ));
-            self.settings.llm_backend = Some(provider_id.to_string());
+            self.set_llm_backend_preserving_model(provider_id);
             return Ok(());
         };
 
@@ -968,9 +1137,19 @@ impl SetupWizard {
         Ok(())
     }
 
+    /// Update the selected LLM backend while preserving the current model when
+    /// the backend did not actually change.
+    fn set_llm_backend_preserving_model(&mut self, backend: &str) {
+        let backend_changed = self.settings.llm_backend.as_deref() != Some(backend);
+        self.settings.llm_backend = Some(backend.to_string());
+        if backend_changed {
+            self.settings.selected_model = None;
+        }
+    }
+
     /// NEAR AI provider setup (extracted from the old step_authentication).
     async fn setup_nearai(&mut self) -> Result<(), SetupError> {
-        self.settings.llm_backend = Some("nearai".to_string());
+        self.set_llm_backend_preserving_model("nearai");
 
         // Check if we already have a session
         if let Some(ref session) = self.session_manager
@@ -1014,9 +1193,9 @@ impl SetupWizard {
         self.persist_session_to_db().await;
 
         // If the user chose the API key path, NEARAI_API_KEY is now set
-        // in the environment. Persist it to the encrypted secrets store
-        // so inject_llm_keys_from_secrets() can load it on future runs.
-        if let Ok(api_key) = std::env::var("NEARAI_API_KEY")
+        // in the runtime env overlay. Persist it to the encrypted secrets
+        // store so inject_llm_keys_from_secrets() can load it on future runs.
+        if let Some(api_key) = crate::config::helpers::env_or_override("NEARAI_API_KEY")
             && !api_key.is_empty()
             && let Ok(ctx) = self.init_secrets_context().await
         {
@@ -1055,11 +1234,7 @@ impl SetupWizard {
 
     /// Anthropic OAuth setup: extract token from `claude login` credentials.
     async fn setup_anthropic_oauth(&mut self) -> Result<(), SetupError> {
-        // Clear model only when switching providers (old model may be invalid)
-        if self.settings.llm_backend.as_deref() != Some("anthropic") {
-            self.settings.selected_model = None;
-        }
-        self.settings.llm_backend = Some("anthropic".to_string());
+        self.set_llm_backend_preserving_model("anthropic");
 
         // Try to extract existing OAuth token from Claude Code credentials
         if let Some(token) = crate::config::ClaudeCodeConfig::extract_oauth_token() {
@@ -1153,11 +1328,7 @@ impl SetupWizard {
             other => other,
         });
 
-        // Clear model only when switching providers (old model may be invalid)
-        if self.settings.llm_backend.as_deref() != Some(backend) {
-            self.settings.selected_model = None;
-        }
-        self.settings.llm_backend = Some(backend.to_string());
+        self.set_llm_backend_preserving_model(backend);
 
         // Check env var first
         if let Ok(existing) = std::env::var(env_var) {
@@ -1216,11 +1387,7 @@ impl SetupWizard {
         &mut self,
         def: &crate::llm::ProviderDefinition,
     ) -> Result<(), SetupError> {
-        // Clear model only when switching providers (old model may be invalid)
-        if self.settings.llm_backend.as_deref() != Some(&def.id) {
-            self.settings.selected_model = None;
-        }
-        self.settings.llm_backend = Some(def.id.clone());
+        self.set_llm_backend_preserving_model(&def.id);
 
         let default_url = self
             .settings
@@ -1250,10 +1417,7 @@ impl SetupWizard {
 
     /// AWS Bedrock provider setup: region, auth, and cross-region config.
     async fn setup_bedrock(&mut self) -> Result<(), SetupError> {
-        if self.settings.llm_backend.as_deref() != Some("bedrock") {
-            self.settings.selected_model = None;
-        }
-        self.settings.llm_backend = Some("bedrock".to_string());
+        self.set_llm_backend_preserving_model("bedrock");
 
         // Region
         let default_region = self
@@ -1344,11 +1508,7 @@ impl SetupWizard {
         secret_name: &str,
         display_name: &str,
     ) -> Result<(), SetupError> {
-        // Clear model only when switching providers (old model may be invalid)
-        if self.settings.llm_backend.as_deref() != Some(backend_id) {
-            self.settings.selected_model = None;
-        }
-        self.settings.llm_backend = Some(backend_id.to_string());
+        self.set_llm_backend_preserving_model(backend_id);
 
         let existing_url = self
             .settings
@@ -1573,46 +1733,18 @@ impl SetupWizard {
     }
 
     /// Fetch available models from the NEAR AI API.
+    ///
+    /// Uses [`build_nearai_model_fetch_config`] to construct the provider config,
+    /// which reads `NEARAI_API_KEY` from the environment when present.
     async fn fetch_nearai_models(&self) -> Vec<String> {
         let session = match self.session_manager {
             Some(ref s) => Arc::clone(s),
             None => return vec![],
         };
 
-        use crate::config::LlmConfig;
         use crate::llm::create_llm_provider;
 
-        let base_url = std::env::var("NEARAI_BASE_URL")
-            .unwrap_or_else(|_| "https://private.near.ai".to_string());
-        let auth_base_url = std::env::var("NEARAI_AUTH_URL")
-            .unwrap_or_else(|_| "https://private.near.ai".to_string());
-
-        let config = LlmConfig {
-            backend: "nearai".to_string(),
-            session: crate::llm::session::SessionConfig {
-                auth_base_url,
-                session_path: crate::config::llm::default_session_path(),
-            },
-            nearai: crate::config::NearAiConfig {
-                model: "dummy".to_string(),
-                cheap_model: None,
-                base_url,
-                api_key: None,
-                fallback_model: None,
-                max_retries: 3,
-                circuit_breaker_threshold: None,
-                circuit_breaker_recovery_secs: 30,
-                response_cache_enabled: false,
-                response_cache_ttl_secs: 3600,
-                response_cache_max_entries: 1000,
-                failover_cooldown_secs: 300,
-                failover_cooldown_threshold: 3,
-                smart_routing_cascade: true,
-            },
-            provider: None,
-            bedrock: None,
-            request_timeout_secs: 120,
-        };
+        let config = build_nearai_model_fetch_config();
 
         match create_llm_provider(&config, session).await {
             Ok(provider) => match provider.list_models().await {
@@ -2472,8 +2604,9 @@ impl SetupWizard {
             env_vars.push((base_url_env.clone(), base_url.clone()));
         }
 
-        // Preserve NEARAI_API_KEY if present (set by API key auth flow)
-        if let Ok(api_key) = std::env::var("NEARAI_API_KEY")
+        // Preserve NEARAI_API_KEY if present (set by API key auth flow
+        // via the thread-safe runtime env overlay).
+        if let Some(api_key) = crate::config::helpers::env_or_override("NEARAI_API_KEY")
             && !api_key.is_empty()
         {
             env_vars.push(("NEARAI_API_KEY".to_string(), api_key));
@@ -2534,7 +2667,7 @@ impl SetupWizard {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            crate::bootstrap::save_bootstrap_env(&pairs).map_err(|e| {
+            crate::bootstrap::upsert_bootstrap_vars(&pairs).map_err(|e| {
                 SetupError::Io(std::io::Error::other(format!(
                     "Failed to save bootstrap env to .env: {}",
                     e
@@ -2805,6 +2938,13 @@ impl SetupWizard {
         println!("  ironclaw config set <setting> <value>");
         println!("  ironclaw onboard");
         println!();
+
+        if self.config.quick {
+            print_info(
+                "Tip: Run `ironclaw onboard` to configure channels, extensions, embeddings, and more.",
+            );
+            println!();
+        }
 
         Ok(())
     }
@@ -3240,6 +3380,58 @@ async fn discover_wasm_channels(dir: &std::path::Path) -> Vec<(String, ChannelCa
 /// Mask an API key for display: show first 6 + last 4 chars.
 ///
 /// Uses char-based indexing to avoid panicking on multi-byte UTF-8.
+/// Build the `LlmConfig` used by `fetch_nearai_models` to list available models.
+///
+/// Reads `NEARAI_API_KEY` from the environment so that users who authenticated
+/// via Cloud API key (option 4) don't get re-prompted during model selection.
+fn build_nearai_model_fetch_config() -> crate::config::LlmConfig {
+    // If the user authenticated via API key (option 4), the key is stored
+    // as an env var. Pass it through so `resolve_bearer_token()` doesn't
+    // re-trigger the interactive auth prompt.
+    let api_key = std::env::var("NEARAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .map(secrecy::SecretString::from);
+
+    // Match the same base_url logic as LlmConfig::resolve(): use cloud-api
+    // when an API key is present, private.near.ai for session-token auth.
+    let default_base = if api_key.is_some() {
+        "https://cloud-api.near.ai"
+    } else {
+        "https://private.near.ai"
+    };
+    let base_url = std::env::var("NEARAI_BASE_URL").unwrap_or_else(|_| default_base.to_string());
+    let auth_base_url =
+        std::env::var("NEARAI_AUTH_URL").unwrap_or_else(|_| "https://private.near.ai".to_string());
+
+    crate::config::LlmConfig {
+        backend: "nearai".to_string(),
+        session: crate::llm::session::SessionConfig {
+            auth_base_url,
+            session_path: crate::config::llm::default_session_path(),
+        },
+        nearai: crate::config::NearAiConfig {
+            model: "dummy".to_string(),
+            cheap_model: None,
+            base_url,
+            api_key,
+            fallback_model: None,
+            max_retries: 3,
+            circuit_breaker_threshold: None,
+            circuit_breaker_recovery_secs: 30,
+            response_cache_enabled: false,
+            response_cache_ttl_secs: 3600,
+            response_cache_max_entries: 1000,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
+            smart_routing_cascade: true,
+        },
+        provider: None,
+        bedrock: None,
+        request_timeout_secs: 120,
+    }
+}
+
 fn mask_api_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     if chars.len() < 12 {
@@ -3448,6 +3640,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::config::helpers::ENV_MUTEX;
 
     #[test]
     fn test_wizard_creation() {
@@ -3462,6 +3655,7 @@ mod tests {
             skip_auth: true,
             channels_only: false,
             provider_only: false,
+            quick: false,
         };
         let wizard = SetupWizard::with_config(config);
         assert!(wizard.config.skip_auth);
@@ -3640,6 +3834,14 @@ mod tests {
     }
 
     impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
         fn clear(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
             unsafe {
@@ -3659,6 +3861,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_set_llm_backend_preserves_model_when_backend_unchanged() {
+        let mut wizard = SetupWizard::new();
+        wizard.settings.llm_backend = Some("openai".to_string());
+        wizard.settings.selected_model = Some("gpt-4o".to_string());
+
+        wizard.set_llm_backend_preserving_model("openai");
+
+        assert_eq!(wizard.settings.llm_backend.as_deref(), Some("openai"));
+        assert_eq!(wizard.settings.selected_model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn test_set_llm_backend_clears_model_when_backend_was_unset() {
+        let mut wizard = SetupWizard::new();
+        wizard.settings.selected_model = Some("gpt-4o".to_string());
+
+        wizard.set_llm_backend_preserving_model("openai");
+
+        assert_eq!(wizard.settings.llm_backend.as_deref(), Some("openai"));
+        assert_eq!(wizard.settings.selected_model, None);
+    }
+
+    #[test]
+    fn test_set_llm_backend_clears_model_when_backend_changes() {
+        let mut wizard = SetupWizard::new();
+        wizard.settings.llm_backend = Some("openai".to_string());
+        wizard.settings.selected_model = Some("gpt-4o".to_string());
+
+        wizard.set_llm_backend_preserving_model("anthropic");
+
+        assert_eq!(wizard.settings.llm_backend.as_deref(), Some("anthropic"));
+        assert_eq!(wizard.settings.selected_model, None);
     }
 
     /// Regression test for #600: re-running provider setup for the same backend
@@ -3826,5 +4063,65 @@ mod tests {
             ..Settings::default()
         };
         assert!(settings.secrets_master_key_hex.is_some());
+    }
+
+    /// Regression test for #799: `fetch_nearai_models` hardcoded `api_key: None`,
+    /// causing the auth prompt to re-appear during model selection when the user
+    /// had authenticated via NEAR AI Cloud API key (option 4).
+    #[test]
+    fn test_build_nearai_model_fetch_config_picks_up_api_key_env() {
+        use secrecy::ExposeSecret;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("NEARAI_API_KEY", "test-cloud-api-key-12345");
+        let _guard2 = EnvGuard::clear("NEARAI_BASE_URL");
+
+        let config = build_nearai_model_fetch_config();
+        assert!(
+            config.nearai.api_key.is_some(),
+            "config should include NEARAI_API_KEY from env"
+        );
+        assert_eq!(
+            config.nearai.api_key.as_ref().unwrap().expose_secret(),
+            "test-cloud-api-key-12345"
+        );
+        // With API key, base_url must point to cloud-api (not private.near.ai)
+        assert_eq!(
+            config.nearai.base_url, "https://cloud-api.near.ai",
+            "API key auth must use cloud-api base URL for model fetching"
+        );
+    }
+
+    /// Regression test for #799: when NEARAI_API_KEY is absent or empty,
+    /// the config should have `api_key: None` (session token path).
+    #[test]
+    fn test_build_nearai_model_fetch_config_none_when_no_api_key() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::clear("NEARAI_API_KEY");
+        let _guard2 = EnvGuard::clear("NEARAI_BASE_URL");
+
+        let config = build_nearai_model_fetch_config();
+        assert!(
+            config.nearai.api_key.is_none(),
+            "config should have no api_key when env var is absent"
+        );
+        // Without API key, base_url must point to private.near.ai (session token)
+        assert_eq!(
+            config.nearai.base_url, "https://private.near.ai",
+            "session-token auth must use private.near.ai base URL"
+        );
+    }
+
+    /// Regression test for #799: empty NEARAI_API_KEY should be treated as absent.
+    #[test]
+    fn test_build_nearai_model_fetch_config_none_when_empty_api_key() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("NEARAI_API_KEY", "");
+
+        let config = build_nearai_model_fetch_config();
+        assert!(
+            config.nearai.api_key.is_none(),
+            "config should have no api_key when env var is empty"
+        );
     }
 }
