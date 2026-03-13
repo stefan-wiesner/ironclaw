@@ -13,11 +13,12 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant, sleep};
 use uuid::Uuid;
 
 use crate::channels::IncomingMessage;
 use crate::channels::web::gateway_protocol::{
-    ConnectParams, GatewayEvent, GatewayRequest, GatewayResponse,
+    AgentWaitParams, ConnectParams, GatewayEvent, GatewayRequest, GatewayResponse,
 };
 use crate::channels::web::server::GatewayState;
 
@@ -250,22 +251,40 @@ async fn handle_gateway_request(
                     return Ok(true);
                 }
 
-                // Parse wait params
-                let run_id = params.get("runId").and_then(|r| r.as_str()).map(|s| s.to_string());
-                let run_id = run_id.or_else(|| current_run_id.map(|id| id.to_string()));
+                let wait_params: Result<AgentWaitParams, _> = serde_json::from_value(params);
+                match wait_params {
+                    Ok(wait_params) => {
+                        let run_id = wait_params
+                            .runId
+                            .or_else(|| current_run_id.map(|id| id.to_string()));
+                        let timeout_ms = wait_params.timeoutMs.unwrap_or(30_000);
 
-                // For now, return a simple completion status
-                // A full implementation would wait for the agent run to complete
-                let response = GatewayResponse::ok(
-                    id,
-                    serde_json::json!({
-                        "status": "complete",
-                        "runId": run_id,
-                        "exitCode": 0,
-                    }),
-                );
-                if let Ok(json) = serde_json::to_string(&response) {
-                    let _ = send_tx.send(json).await;
+                        let payload = match run_id {
+                            Some(ref run_id) => {
+                                wait_for_run_completion(state, user_id, run_id, timeout_ms).await
+                            }
+                            None => serde_json::json!({
+                                "status": "error",
+                                "error": "Missing runId",
+                                "exitCode": 1,
+                            }),
+                        };
+
+                        let response = GatewayResponse::ok(id, payload);
+                        if let Ok(json) = serde_json::to_string(&response) {
+                            let _ = send_tx.send(json).await;
+                        }
+                    }
+                    Err(e) => {
+                        let response = GatewayResponse::error(
+                            id,
+                            "invalid_params",
+                            &format!("Invalid agent.wait params: {}", e),
+                        );
+                        if let Ok(json) = serde_json::to_string(&response) {
+                            let _ = send_tx.send(json).await;
+                        }
+                    }
                 }
             }
 
@@ -286,6 +305,76 @@ async fn handle_gateway_request(
     }
 
     Ok(true)
+}
+
+async fn wait_for_run_completion(
+    state: &Arc<GatewayState>,
+    user_id: &str,
+    run_id: &str,
+    timeout_ms: u64,
+) -> serde_json::Value {
+    let Some(session_manager) = state.session_manager.as_ref() else {
+        return serde_json::json!({
+            "status": "ok",
+            "runId": run_id,
+            "exitCode": 0,
+        });
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    loop {
+        if let Some((session, thread_id)) = session_manager
+            .find_thread(user_id, "gateway", Some(run_id))
+            .await
+        {
+            let sess = session.lock().await;
+            if let Some(thread) = sess.threads.get(&thread_id)
+                && let Some(turn) = thread.last_turn()
+            {
+                match turn.state {
+                    crate::agent::TurnState::Completed => {
+                        let summary = turn.response.clone().unwrap_or_default();
+                        return serde_json::json!({
+                            "status": "ok",
+                            "runId": run_id,
+                            "exitCode": 0,
+                            "summary": summary,
+                            "result": {
+                                "text": summary,
+                            },
+                        });
+                    }
+                    crate::agent::TurnState::Failed => {
+                        return serde_json::json!({
+                            "status": "error",
+                            "runId": run_id,
+                            "exitCode": 1,
+                            "error": turn.error.clone().unwrap_or_else(|| "Run failed".to_string()),
+                        });
+                    }
+                    crate::agent::TurnState::Interrupted => {
+                        return serde_json::json!({
+                            "status": "error",
+                            "runId": run_id,
+                            "exitCode": 1,
+                            "error": "Run interrupted",
+                        });
+                    }
+                    crate::agent::TurnState::Processing => {}
+                }
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return serde_json::json!({
+                "status": "timeout",
+                "runId": run_id,
+                "exitCode": 1,
+            });
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Validate authentication from connect params.
@@ -370,6 +459,7 @@ mod tests {
             skill_catalog: None,
             scheduler: None,
             chat_rate_limiter: crate::channels::web::server::RateLimiter::new(30, 60),
+            oauth_rate_limiter: crate::channels::web::server::RateLimiter::new(10, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),

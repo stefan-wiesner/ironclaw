@@ -92,10 +92,11 @@ impl GatewayEvent {
     }
 
     /// Create an agent event with streamed data.
-    pub fn agent_event(stream: &str, data: serde_json::Value, seq: u64) -> Self {
+    pub fn agent_event(run_id: &Uuid, stream: &str, data: serde_json::Value, seq: u64) -> Self {
         GatewayEvent::Event {
             event: "agent".to_string(),
             payload: Some(serde_json::json!({
+                "runId": run_id.to_string(),
                 "stream": stream,
                 "data": data,
             })),
@@ -108,6 +109,7 @@ impl GatewayEvent {
         GatewayEvent::Event {
             event: "agent".to_string(),
             payload: Some(serde_json::json!({
+                "runId": run_id.to_string(),
                 "stream": "run_id",
                 "data": run_id.to_string(),
             })),

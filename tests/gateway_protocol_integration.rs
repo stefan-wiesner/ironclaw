@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
+use ironclaw::agent::{SessionManager, Thread};
 use ironclaw::channels::IncomingMessage;
 use ironclaw::channels::web::server::{start_server, GatewayState, RateLimiter};
 use ironclaw::channels::web::sse::SseManager;
@@ -28,7 +30,7 @@ async fn start_test_server() -> (
         msg_tx: tokio::sync::RwLock::new(Some(agent_tx)),
         sse: SseManager::new(),
         workspace: None,
-        session_manager: None,
+        session_manager: Some(Arc::new(SessionManager::new())),
         log_broadcaster: None,
         log_level_handle: None,
         extension_manager: None,
@@ -44,6 +46,7 @@ async fn start_test_server() -> (
         skill_registry: None,
         skill_catalog: None,
         chat_rate_limiter: RateLimiter::new(30, 60),
+        oauth_rate_limiter: RateLimiter::new(10, 60),
         registry_entries: Vec::new(),
         cost_guard: None,
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
@@ -254,7 +257,100 @@ async fn test_gateway_agent_request_reaches_agent_loop_and_wait_succeeds() {
 
     let wait_response = recv_json(&mut ws).await;
     assert_eq!(wait_response["ok"], true);
-    assert_eq!(wait_response["payload"]["exitCode"], 0);
+    assert_eq!(wait_response["payload"]["status"], "timeout");
+
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_gateway_wait_returns_completed_thread_summary() {
+    let (addr, state, _agent_rx) = start_test_server().await;
+    let run_id = Uuid::new_v4();
+    let session_manager = state.session_manager.as_ref().unwrap().clone();
+    let session = session_manager.get_or_create_session("test-user").await;
+    {
+        let mut sess = session.lock().await;
+        let mut thread = Thread::with_id(run_id, sess.id);
+        thread.start_turn("hello from gateway");
+        thread.complete_turn("assistant summary from ironclaw");
+        sess.threads.insert(run_id, thread);
+    }
+    session_manager
+        .register_thread("test-user", "gateway", run_id, Arc::clone(&session))
+        .await;
+
+    let mut ws = connect_gateway_ws(addr, true).await;
+    let nonce = expect_challenge(&mut ws).await;
+    let connected = send_connect(&mut ws, &nonce, true).await;
+    assert_eq!(connected["ok"], true);
+
+    ws.send(Message::Text(
+        json!({
+            "type": "req",
+            "id": "wait-2",
+            "method": "agent.wait",
+            "params": {
+                "runId": run_id.to_string(),
+                "timeoutMs": 1000
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let wait_response = recv_json(&mut ws).await;
+    assert_eq!(wait_response["ok"], true);
+    assert_eq!(wait_response["payload"]["status"], "ok");
+    assert_eq!(wait_response["payload"]["summary"], "assistant summary from ironclaw");
+    assert_eq!(wait_response["payload"]["result"]["text"], "assistant summary from ironclaw");
+
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_gateway_wait_returns_failed_thread_error() {
+    let (addr, state, _agent_rx) = start_test_server().await;
+    let run_id = Uuid::new_v4();
+    let session_manager = state.session_manager.as_ref().unwrap().clone();
+    let session = session_manager.get_or_create_session("test-user").await;
+    {
+        let mut sess = session.lock().await;
+        let mut thread = Thread::with_id(run_id, sess.id);
+        thread.start_turn("hello from gateway");
+        thread.fail_turn("gateway test failure");
+        sess.threads.insert(run_id, thread);
+    }
+    session_manager
+        .register_thread("test-user", "gateway", run_id, Arc::clone(&session))
+        .await;
+
+    let mut ws = connect_gateway_ws(addr, true).await;
+    let nonce = expect_challenge(&mut ws).await;
+    let connected = send_connect(&mut ws, &nonce, true).await;
+    assert_eq!(connected["ok"], true);
+
+    ws.send(Message::Text(
+        json!({
+            "type": "req",
+            "id": "wait-3",
+            "method": "agent.wait",
+            "params": {
+                "runId": run_id.to_string(),
+                "timeoutMs": 1000
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let wait_response = recv_json(&mut ws).await;
+    assert_eq!(wait_response["ok"], true);
+    assert_eq!(wait_response["payload"]["status"], "error");
+    assert_eq!(wait_response["payload"]["error"], "gateway test failure");
 
     ws.close(None).await.unwrap();
 }

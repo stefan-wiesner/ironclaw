@@ -186,6 +186,41 @@ impl SessionManager {
         (session, thread_id)
     }
 
+    /// Find an existing thread mapping without creating a new thread.
+    pub async fn find_thread(
+        &self,
+        user_id: &str,
+        channel: &str,
+        external_thread_id: Option<&str>,
+    ) -> Option<(Arc<Mutex<Session>>, Uuid)> {
+        let key = ThreadKey {
+            user_id: user_id.to_string(),
+            channel: channel.to_string(),
+            external_thread_id: external_thread_id.map(String::from),
+        };
+
+        let thread_id = {
+            let thread_map = self.thread_map.read().await;
+            thread_map.get(&key).copied()
+        }?;
+
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(user_id).cloned()
+        }?;
+
+        let exists = {
+            let sess = session.lock().await;
+            sess.threads.contains_key(&thread_id)
+        };
+
+        if exists {
+            Some((session, thread_id))
+        } else {
+            None
+        }
+    }
+
     /// Register a hydrated thread so subsequent `resolve_thread` calls find it.
     ///
     /// Inserts into the thread_map and creates an undo manager for the thread.
