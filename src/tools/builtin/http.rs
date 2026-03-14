@@ -114,7 +114,7 @@ pub(crate) fn validate_url(url: &str) -> Result<reqwest::Url, ToolError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| ToolError::InvalidParameters(format!("invalid URL: {}", e)))?;
 
-    if parsed.scheme() != "https" {
+    if parsed.scheme() != "https" && !is_local_loopback_http_url(&parsed) {
         return Err(ToolError::NotAuthorized(
             "only https URLs are allowed".to_string(),
         ));
@@ -134,6 +134,7 @@ pub(crate) fn validate_url(url: &str) -> Result<reqwest::Url, ToolError> {
     // Check literal IP addresses
     if let Ok(ip) = host.parse::<IpAddr>()
         && is_disallowed_ip(&ip)
+        && !is_local_loopback_http_url(&parsed)
     {
         return Err(ToolError::NotAuthorized(
             "private or local IPs are not allowed".to_string(),
@@ -174,7 +175,9 @@ pub(crate) async fn validate_and_resolve_url(
     }
 
     for addr in &addrs {
-        if is_disallowed_ip(&addr.ip()) {
+        if is_disallowed_ip(&addr.ip())
+            && !(is_local_loopback_http_url(url) && is_loopback_ip(&addr.ip()))
+        {
             return Err(ToolError::NotAuthorized(format!(
                 "hostname '{}' resolves to disallowed IP {}",
                 host,
@@ -214,6 +217,34 @@ fn is_disallowed_ipv4(v4: &Ipv4Addr) -> bool {
         || v4.is_multicast()
         || v4.is_unspecified()
         || *v4 == Ipv4Addr::new(169, 254, 169, 254)
+}
+
+fn is_loopback_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback();
+            }
+            v6.is_loopback()
+        }
+    }
+}
+
+fn is_local_loopback_http_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "http" {
+        return false;
+    }
+
+    let host = match url.host_str() {
+        Some(value) => value,
+        None => return false,
+    };
+
+    match host.parse::<IpAddr>() {
+        Ok(ip) => is_loopback_ip(&ip),
+        Err(_) => false,
+    }
 }
 
 fn is_disallowed_ip(ip: &IpAddr) -> bool {
@@ -284,7 +315,7 @@ fn parse_headers_param(
     }
 
     match headers {
-        None => Ok(Vec::new()),
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
         Some(serde_json::Value::String(raw)) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -872,6 +903,13 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_url_accepts_http_loopback_ip() {
+        let url = validate_url("http://127.0.0.1:3100/api/health").unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.scheme(), "http");
+    }
+
+    #[test]
     fn test_validate_url_rejects_localhost() {
         let err = validate_url("https://localhost:8080").unwrap_err();
         assert!(err.to_string().contains("localhost"));
@@ -991,6 +1029,13 @@ mod tests {
             parsed,
             vec![("Authorization".to_string(), "Bearer token".to_string())]
         );
+    }
+
+    #[test]
+    fn test_parse_headers_param_treats_null_as_empty() {
+        let headers = serde_json::Value::Null;
+        let parsed = parse_headers_param(Some(&headers)).unwrap();
+        assert!(parsed.is_empty());
     }
 
     #[test]
@@ -1313,6 +1358,14 @@ mod tests {
             "expected disallowed IP error, got: {}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_resolve_accepts_http_loopback_ip() {
+        let url = reqwest::Url::parse("http://127.0.0.1:3100/test").unwrap();
+        let addrs = validate_and_resolve_url(&url).await.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|addr| is_loopback_ip(&addr.ip())));
     }
 
     // Requires network access -- run with: cargo test -- --ignored
