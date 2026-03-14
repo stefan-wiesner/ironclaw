@@ -201,6 +201,28 @@ async fn handle_gateway_request(
 
                 *current_run_id = Some(run_id);
 
+                // Pre-register the run as a thread so the agent loop can
+                // route it without treating it as a forged/unowned conversation
+                // ID. Paperclip run UUIDs are minted by the cloud and will never
+                // pre-exist in IronClaw's local DB.
+                if let Some(ref sm) = state.session_manager {
+                    tracing::debug!(run_id = %run_id, user_id = %user_id, "Pre-registering thread in session manager");
+                    let session = sm.get_or_create_session(user_id).await;
+                    {
+                        let mut sess = session.lock().await;
+                        if !sess.threads.contains_key(&run_id) {
+                            tracing::debug!(run_id = %run_id, "Creating new thread in session");
+                            let thread = crate::agent::session::Thread::with_id(run_id, sess.id);
+                            sess.threads.insert(run_id, thread);
+                        } else {
+                            tracing::debug!(run_id = %run_id, "Thread already exists in session");
+                        }
+                    }
+                    sm.register_thread(user_id, "gateway", run_id, session).await;
+                } else {
+                    tracing::warn!("Gateway state is missing session_manager");
+                }
+
                 // Create incoming message for agent
                 let incoming = IncomingMessage::new("gateway", user_id, &message)
                     .with_thread(&run_id.to_string());
@@ -322,11 +344,18 @@ async fn wait_for_run_completion(
     };
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    // If the agent loop accepted the message it should create a thread quickly.
+    // After 30 s without a thread we conclude the dispatch failed (e.g. agent loop
+    // crashed or the channel was closed between accept and processing).
+    let thread_discovery_deadline = Instant::now() + Duration::from_secs(30);
+    let mut thread_found_once = false;
+
     loop {
         if let Some((session, thread_id)) = session_manager
             .find_thread(user_id, "gateway", Some(run_id))
             .await
         {
+            thread_found_once = true;
             let sess = session.lock().await;
             if let Some(thread) = sess.threads.get(&thread_id)
                 && let Some(turn) = thread.last_turn()
@@ -365,11 +394,27 @@ async fn wait_for_run_completion(
             }
         }
 
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+
+        if now >= deadline {
             return serde_json::json!({
                 "status": "timeout",
                 "runId": run_id,
                 "exitCode": 1,
+            });
+        }
+
+        // Fast-fail: thread was never created within the discovery window.
+        if !thread_found_once && now >= thread_discovery_deadline {
+            tracing::warn!(
+                run_id = %run_id,
+                "Agent loop did not create a thread within 30s — dispatch likely failed"
+            );
+            return serde_json::json!({
+                "status": "error",
+                "runId": run_id,
+                "exitCode": 1,
+                "error": "Agent loop did not start processing this run within 30s",
             });
         }
 

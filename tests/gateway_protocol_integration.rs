@@ -356,6 +356,68 @@ async fn test_gateway_wait_returns_failed_thread_error() {
 }
 
 #[tokio::test]
+async fn test_gateway_agent_request_pre_registers_thread_in_session_manager() {
+    // Regression test: a fresh Paperclip run UUID must be registered in the
+    // session manager immediately when the gateway WS handler accepts the
+    // `req agent` request — before the message reaches the agent loop.
+    //
+    // Without the fix, maybe_hydrate_thread treats the unknown UUID as a
+    // forged conversation ID on the "gateway" channel and rejects the message
+    // with "Rejected message for unavailable thread id".
+    let (addr, state, mut agent_rx) = start_test_server().await;
+    let mut ws = connect_gateway_ws(addr, true).await;
+
+    let nonce = expect_challenge(&mut ws).await;
+    let connected = send_connect(&mut ws, &nonce, true).await;
+    assert_eq!(connected["ok"], true);
+
+    let run_id = Uuid::new_v4();
+    ws.send(Message::Text(
+        json!({
+            "type": "req",
+            "id": "agent-preregister",
+            "method": "agent",
+            "params": {
+                "message": "paperclip wake event",
+                "idempotencyKey": run_id.to_string(),
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Drain the accepted response (and optional run_id event)
+    let first = recv_json(&mut ws).await;
+    let response = if first["type"] == "res" {
+        first
+    } else {
+        recv_json(&mut ws).await
+    };
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["payload"]["status"], "accepted");
+
+    // The agent channel must receive the message (pre-registration doesn't block dispatch)
+    let incoming = timeout(TIMEOUT, agent_rx.recv())
+        .await
+        .expect("timed out waiting for agent message")
+        .expect("agent channel closed");
+    assert_eq!(incoming.thread_id.as_deref(), Some(run_id.to_string().as_str()));
+
+    // The session manager must already have a thread for this run_id.
+    // If pre-registration is missing, find_thread returns None here.
+    let sm = state.session_manager.as_ref().expect("session manager present");
+    let found = sm.find_thread("test-user", "gateway", Some(&run_id.to_string())).await;
+    assert!(
+        found.is_some(),
+        "thread for run_id {run_id} must be pre-registered in session manager by gateway WS handler"
+    );
+
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn test_gateway_websocket_requires_http_auth() {
     let (addr, _state, _agent_rx) = start_test_server().await;
     let ws_scheme = "ws";
