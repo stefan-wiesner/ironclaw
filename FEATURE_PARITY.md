@@ -34,7 +34,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Feature | OpenClaw | IronClaw | Notes |
 |---------|----------|----------|-------|
 | Gateway control plane | ✅ | ✅ | Web gateway with 40+ API endpoints |
-| Paperclip gateway protocol | ✅ | ✅ | /api/gateway/ws with challenge handshake, req connect, req agent, agent.wait |
+| Paperclip gateway protocol | ✅ | ✅ | /api/gateway/ws with challenge handshake, req connect, req agent, agent.wait; agent.wait response includes toolDiagnostics.http (count, statuses, all5xx) so Paperclip adapter can mark runs failed on all-5xx HTTP tool calls |
 | HTTP endpoints for Control UI | ✅ | ✅ | Web dashboard with chat, memory, jobs, logs, extensions |
 | Channel connection lifecycle | ✅ | ✅ | ChannelManager + WebSocket tracker |
 | Session management/routing | ✅ | ✅ | SessionManager exists |

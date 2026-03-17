@@ -363,6 +363,7 @@ async fn wait_for_run_completion(
                 match turn.state {
                     crate::agent::TurnState::Completed => {
                         let summary = turn.response.clone().unwrap_or_default();
+                        let tool_diagnostics = build_tool_diagnostics(&turn.tool_calls);
                         return serde_json::json!({
                             "status": "ok",
                             "runId": run_id,
@@ -371,6 +372,7 @@ async fn wait_for_run_completion(
                             "result": {
                                 "text": summary,
                             },
+                            "toolDiagnostics": tool_diagnostics,
                         });
                     }
                     crate::agent::TurnState::Failed => {
@@ -420,6 +422,36 @@ async fn wait_for_run_completion(
 
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn build_tool_diagnostics(tool_calls: &[crate::agent::session::TurnToolCall]) -> serde_json::Value {
+    let http_statuses: Vec<u16> = tool_calls
+        .iter()
+        .filter_map(parse_http_tool_status)
+        .collect();
+
+    serde_json::json!({
+        "http": {
+            "count": http_statuses.len(),
+            "statuses": http_statuses,
+            "all5xx": !http_statuses.is_empty() && http_statuses.iter().all(|status| (500..600).contains(status)),
+        }
+    })
+}
+
+fn parse_http_tool_status(tool_call: &crate::agent::session::TurnToolCall) -> Option<u16> {
+    if tool_call.name != "http" {
+        return None;
+    }
+    let raw = tool_call.result.as_ref()?.as_str()?.trim();
+    let normalized = raw
+        .strip_prefix("<tool_output name=\"http\" sanitized=\"false\">\n")
+        .or_else(|| raw.strip_prefix("<tool_output name=\"http\" sanitized=\"true\">\n"))
+        .unwrap_or(raw);
+    let normalized = normalized.strip_suffix("\n</tool_output>").unwrap_or(normalized).trim();
+    let parsed: serde_json::Value = serde_json::from_str(normalized).ok()?;
+    let status = parsed.get("status")?.as_u64()?;
+    u16::try_from(status).ok()
 }
 
 /// Validate authentication from connect params.
@@ -548,5 +580,46 @@ mod tests {
             device: None,
         };
         assert!(!validate_auth(&missing_auth, &state, "nonce-123"));
+    }
+
+    #[test]
+    fn test_parse_http_tool_status_from_wrapped_output() {
+        let tool_call = crate::agent::session::TurnToolCall {
+            name: "http".to_string(),
+            parameters: serde_json::json!({ "url": "http://127.0.0.1:3100/api/agents/me" }),
+            result: Some(serde_json::json!(
+                "<tool_output name=\"http\" sanitized=\"false\">\n{\n  \"status\": 500,\n  \"headers\": {},\n  \"body\": \"{\\\"error\\\":\\\"Internal server error\\\"}\"\n}\n</tool_output>"
+            )),
+            error: None,
+        };
+
+        assert_eq!(parse_http_tool_status(&tool_call), Some(500));
+    }
+
+    #[test]
+    fn test_build_tool_diagnostics_reports_all_http_5xx() {
+        let tool_calls = vec![
+            crate::agent::session::TurnToolCall {
+                name: "http".to_string(),
+                parameters: serde_json::json!({}),
+                result: Some(serde_json::json!(
+                    "<tool_output name=\"http\" sanitized=\"false\">\n{\n  \"status\": 500\n}\n</tool_output>"
+                )),
+                error: None,
+            },
+            crate::agent::session::TurnToolCall {
+                name: "http".to_string(),
+                parameters: serde_json::json!({}),
+                result: Some(serde_json::json!(
+                    "<tool_output name=\"http\" sanitized=\"false\">\n{\n  \"status\": 502\n}\n</tool_output>"
+                )),
+                error: None,
+            },
+        ];
+
+        let diagnostics = build_tool_diagnostics(&tool_calls);
+        assert_eq!(diagnostics["http"]["count"], serde_json::json!(2));
+        assert_eq!(diagnostics["http"]["statuses"], serde_json::json!([500, 502]));
+        assert_eq!(diagnostics["http"]["all5xx"], serde_json::json!(true));
     }
 }
