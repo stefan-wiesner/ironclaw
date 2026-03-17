@@ -242,6 +242,14 @@ pub enum SseEvent {
         thread_id: Option<String>,
     },
 
+    /// Suggested follow-up messages for the user.
+    #[serde(rename = "suggestions")]
+    Suggestions {
+        suggestions: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
+
     /// Extension activation status change (WASM channels).
     #[serde(rename = "extension_status")]
     ExtensionStatus {
@@ -402,6 +410,40 @@ pub struct TransitionInfo {
 
 // --- Extensions ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionActivationStatus {
+    Installed,
+    Configured,
+    Pairing,
+    Active,
+    Failed,
+}
+
+pub fn classify_wasm_channel_activation(
+    ext: &crate::extensions::InstalledExtension,
+    has_paired: bool,
+    has_owner_binding: bool,
+) -> Option<ExtensionActivationStatus> {
+    if ext.kind != crate::extensions::ExtensionKind::WasmChannel {
+        return None;
+    }
+
+    Some(if ext.activation_error.is_some() {
+        ExtensionActivationStatus::Failed
+    } else if !ext.authenticated {
+        ExtensionActivationStatus::Installed
+    } else if ext.active {
+        if has_paired || has_owner_binding {
+            ExtensionActivationStatus::Active
+        } else {
+            ExtensionActivationStatus::Pairing
+        }
+    } else {
+        ExtensionActivationStatus::Configured
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct ExtensionInfo {
     pub name: String,
@@ -420,9 +462,9 @@ pub struct ExtensionInfo {
     /// Whether this extension has an auth configuration (OAuth or manual token).
     #[serde(default)]
     pub has_auth: bool,
-    /// WASM channel activation status: "installed", "configured", "active", "failed".
+    /// WASM channel activation status.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub activation_status: Option<String>,
+    pub activation_status: Option<ExtensionActivationStatus>,
     /// Human-readable error when activation_status is "failed".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation_error: Option<String>,
@@ -495,6 +537,9 @@ pub struct ActionResponse {
     /// Whether the channel was successfully activated after setup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activated: Option<bool>,
+    /// Pending manual verification challenge (for Telegram owner binding, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::extensions::VerificationChallenge>,
 }
 
 impl ActionResponse {
@@ -506,6 +551,7 @@ impl ActionResponse {
             awaiting_token: None,
             instructions: None,
             activated: None,
+            verification: None,
         }
     }
 
@@ -517,6 +563,7 @@ impl ActionResponse {
             awaiting_token: None,
             instructions: None,
             activated: None,
+            verification: None,
         }
     }
 }
@@ -707,6 +754,7 @@ impl WsServerMessage {
             SseEvent::JobStatus { .. } => "job_status",
             SseEvent::JobResult { .. } => "job_result",
             SseEvent::ImageGenerated { .. } => "image_generated",
+            SseEvent::Suggestions { .. } => "suggestions",
             SseEvent::ExtensionStatus { .. } => "extension_status",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
@@ -726,6 +774,7 @@ pub struct RoutineInfo {
     pub description: String,
     pub enabled: bool,
     pub trigger_type: String,
+    pub trigger_raw: String,
     pub trigger_summary: String,
     pub action_type: String,
     pub last_run_at: Option<String>,
@@ -738,25 +787,34 @@ pub struct RoutineInfo {
 impl RoutineInfo {
     /// Convert a `Routine` to the trimmed `RoutineInfo` for list display.
     pub fn from_routine(r: &crate::agent::routine::Routine) -> Self {
-        let (trigger_type, trigger_summary) = match &r.trigger {
-            crate::agent::routine::Trigger::Cron { schedule, .. } => {
-                ("cron".to_string(), format!("cron: {}", schedule))
-            }
+        let (trigger_type, trigger_raw, trigger_summary) = match &r.trigger {
+            crate::agent::routine::Trigger::Cron { schedule, timezone } => (
+                "cron".to_string(),
+                schedule.clone(),
+                crate::agent::routine::describe_cron(schedule, timezone.as_deref()),
+            ),
             crate::agent::routine::Trigger::Event {
                 pattern, channel, ..
             } => {
                 let ch = channel.as_deref().unwrap_or("any");
-                ("event".to_string(), format!("on {} /{}/", ch, pattern))
+                (
+                    "event".to_string(),
+                    String::new(),
+                    format!("on {} /{}/", ch, pattern),
+                )
             }
             crate::agent::routine::Trigger::SystemEvent {
                 source, event_type, ..
             } => (
                 "system_event".to_string(),
+                String::new(),
                 format!("event: {}.{}", source, event_type),
             ),
-            crate::agent::routine::Trigger::Manual => {
-                ("manual".to_string(), "manual only".to_string())
-            }
+            crate::agent::routine::Trigger::Manual => (
+                "manual".to_string(),
+                String::new(),
+                "manual only".to_string(),
+            ),
         };
 
         let action_type = match &r.action {
@@ -778,6 +836,7 @@ impl RoutineInfo {
             description: r.description.clone(),
             enabled: r.enabled,
             trigger_type,
+            trigger_raw,
             trigger_summary,
             action_type: action_type.to_string(),
             last_run_at: r.last_run_at.map(|dt| dt.to_rfc3339()),
@@ -809,6 +868,9 @@ pub struct RoutineDetailResponse {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    pub trigger_type: String,
+    pub trigger_raw: String,
+    pub trigger_summary: String,
     pub trigger: serde_json::Value,
     pub action: serde_json::Value,
     pub guardrails: serde_json::Value,
