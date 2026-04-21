@@ -2264,7 +2264,7 @@ async fn process_mission_outcome_and_notify(
             }
         }
         ThreadOutcome::Completed { response: None } => {}
-        ThreadOutcome::Failed { error } => {
+        ThreadOutcome::Failed { error, .. } => {
             // A terminal thread failure means the mission did not merely
             // produce a disappointing result — the execution itself crashed.
             // Leave a durable failed status so cron/event schedulers stop
@@ -3869,6 +3869,7 @@ mod tests {
             ThreadId::new(),
             &ThreadOutcome::Failed {
                 error: "github api returned 404".into(),
+                debug_detail: None,
             },
         )
         .await
@@ -5477,6 +5478,7 @@ mod tests {
             synthetic_thread_id,
             &ThreadOutcome::Failed {
                 error: "container exited 137".into(),
+                debug_detail: None,
             },
             mgr.notification_tx_for_test(),
             None,

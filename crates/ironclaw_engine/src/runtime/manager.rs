@@ -387,9 +387,13 @@ impl ThreadManager {
 
             let outcome = match result {
                 Ok(outcome) => outcome,
-                Err(error) => ThreadOutcome::Failed {
-                    error: error.to_string(),
-                },
+                Err(error) => {
+                    let debug_detail = error.debug_detail().map(|s| s.to_string());
+                    ThreadOutcome::Failed {
+                        error: error.to_string(),
+                        debug_detail,
+                    }
+                }
             };
             completed.write().await.insert(thread_id, outcome.clone());
             running.write().await.remove(&thread_id);
@@ -523,6 +527,7 @@ impl ThreadManager {
                         error!(thread_id = %thread_id, "thread task panicked: {e}");
                         Ok(ThreadOutcome::Failed {
                             error: format!("thread task panicked: {e}"),
+                            debug_detail: None,
                         })
                     }
                 };
